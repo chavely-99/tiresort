@@ -1973,6 +1973,7 @@ with tab_results:
             success, msg = refine_cross(solution, st.session_state.cross_target, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
+                st.session_state.results = solution  # SAVE CHANGES
                 st.toast(f"Cross refined: {msg}")
                 st.rerun()
             else:
@@ -1982,6 +1983,7 @@ with tab_results:
             success, msg = refine_shift(solution, st.session_state.cross_target, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
+                st.session_state.results = solution  # SAVE CHANGES
                 st.toast(f"Shift refined: {msg}")
                 st.rerun()
             else:
@@ -1991,6 +1993,7 @@ with tab_results:
             success, msg = refine_date(solution, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
+                st.session_state.results = solution  # SAVE CHANGES
                 st.toast(f"Date refined: {msg}")
                 st.rerun()
             else:
@@ -2000,7 +2003,8 @@ with tab_results:
             success, msg = refine_rr_rollout(solution, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
-                st.session_state.results = sort_by_rr_rollout(solution)
+                solution = sort_by_rr_rollout(solution)  # Sort
+                st.session_state.results = solution  # SAVE CHANGES
                 st.toast(f"RR refined: {msg}")
                 st.rerun()
             else:
@@ -2010,6 +2014,7 @@ with tab_results:
             success, msg = refine_rate(solution, rate_pref, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
+                st.session_state.results = solution  # SAVE CHANGES
                 st.toast(f"Rate refined: {msg}")
                 st.rerun()
             else:
