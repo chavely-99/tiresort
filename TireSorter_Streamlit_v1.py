@@ -366,74 +366,6 @@ def load_tire_data(file_source) -> pd.DataFrame:
     return df
 
 
-def detect_track_type(df: pd.DataFrame) -> Tuple[str, List[str]]:
-    """Auto-detect track type from D-Code distribution.
-
-    Detection Rules:
-    - All same D-Code → Road Course
-    - Two distinct D-Codes with ~50/50 split → Oval
-    - Uneven split → Oval with warning
-
-    Returns:
-        (track_type, warnings):
-            - track_type: 'Oval' or 'Road Course'
-            - warnings: List of warning messages (if any)
-    """
-    warnings = []
-
-    if 'D-Code' not in df.columns:
-        warnings.append("⚠️ No D-Code column found - defaulting to Oval mode")
-        return 'Oval', warnings
-
-    # Get D-Code distribution
-    dcodes = df['D-Code'].value_counts()
-    unique_dcodes = len(dcodes)
-
-    if unique_dcodes == 0:
-        warnings.append("⚠️ No D-Codes found - defaulting to Oval mode")
-        return 'Oval', warnings
-
-    elif unique_dcodes == 1:
-        # All tires have same D-Code → Road Course
-        only_dcode = dcodes.index[0]
-        return 'Road Course', warnings
-
-    elif unique_dcodes == 2:
-        # Two D-Codes → Check for 50/50 split (Oval pattern)
-        counts = dcodes.values
-        total_tires = len(df)
-
-        # Calculate split percentage (should be close to 50/50 for Oval)
-        split_percent = min(counts) / total_tires * 100
-
-        if split_percent >= 45 and split_percent <= 55:
-            # Good 50/50 split → Oval
-            return 'Oval', warnings
-        elif split_percent >= 40 and split_percent <= 60:
-            # Acceptable but uneven split → Oval with warning
-            warnings.append(
-                f"⚠️ Uneven tire split detected: {counts[0]} vs {counts[1]} tires. "
-                f"Expected ~50/50 for Oval mode."
-            )
-            return 'Oval', warnings
-        else:
-            # Very uneven split → Warn and default to Oval
-            warnings.append(
-                f"⚠️ Very uneven tire split: {counts[0]} vs {counts[1]} tires. "
-                f"Defaulting to Oval mode but verify tire data."
-            )
-            return 'Oval', warnings
-
-    else:
-        # 3+ D-Codes → Unexpected, default to Oval with warning
-        dcode_list = ', '.join(dcodes.index.tolist())
-        warnings.append(
-            f"⚠️ Found {unique_dcodes} different D-Codes ({dcode_list}). "
-            f"Expected 1 (Road Course) or 2 (Oval). Defaulting to Oval mode."
-        )
-        return 'Oval', warnings
-
-
 def load_tire_data_from_two_files(csv_file_source, excel_file_source) -> Tuple[pd.DataFrame, Optional[List[dict]]]:
     """Load tire data from TWO files: CSV with previous sort + Excel with all available tires.
 
@@ -660,17 +592,6 @@ def assign_positions(df: pd.DataFrame, ls_dcode: str, track_type: str = 'Oval') 
         a_tires = df[wheel_str.str.endswith('A')].copy()
         non_a_tires = df[~wheel_str.str.endswith('A')].copy()
         return a_tires, non_a_tires
-    elif track_type == 'Road Course' and 'Wheel' not in df.columns:
-        # Missing Wheel column for Road Course → Show error and fallback to D-Code mode
-        import streamlit as st
-        st.error(
-            "❌ Road Course mode requires 'Wheel' column to assign tire pools. "
-            "Please verify your tire scan data includes Wheel information."
-        )
-        # Fallback to D-Code mode
-        left_tires = df[df['D-Code'] == str(ls_dcode)].copy()
-        right_tires = df[df['D-Code'] != str(ls_dcode)].copy()
-        return left_tires, right_tires
     else:
         left_tires = df[df['D-Code'] == str(ls_dcode)].copy()
         right_tires = df[df['D-Code'] != str(ls_dcode)].copy()
@@ -1744,49 +1665,14 @@ with tab_settings:
                     dcodes = sorted(df['D-Code'].unique().tolist())
                     st.session_state.available_dcodes = dcodes
 
-                    # Auto-detect track type from D-Code distribution
-                    detected_type, type_warnings = detect_track_type(new_tires_df)
-
-                    # Verify it matches existing sets' track type (stored in session state)
-                    if st.session_state.track_type != detected_type:
-                        st.warning(
-                            f"⚠️ Track type mismatch: Existing sets used **{st.session_state.track_type}**, "
-                            f"but new tires suggest **{detected_type}**. Using existing mode: **{st.session_state.track_type}**."
-                        )
-                        # Keep existing track type, don't override
+                    # Auto-select LS D-Code as the one with smaller avg rollout
+                    if len(dcodes) >= 2:
+                        avg_rollouts = {d: df[df['D-Code'] == d]['Rollout/Dia'].mean() for d in dcodes}
+                        st.session_state.ls_dcode = min(avg_rollouts, key=avg_rollouts.get)
+                    elif dcodes:
+                        st.session_state.ls_dcode = dcodes[0]
                     else:
-                        st.session_state.track_type = detected_type
-                        st.success(f"✅ Track type confirmed: **{detected_type}**")
-
-                    # Display warnings if any
-                    if type_warnings:
-                        for warning in type_warnings:
-                            st.warning(warning)
-
-                    # Auto-select LS D-Code based on track type
-                    if st.session_state.track_type == 'Road Course':
-                        # Road Course: All tires have same D-Code, so just pick the only one
-                        if len(dcodes) >= 1:
-                            st.session_state.ls_dcode = dcodes[0]
-                        else:
-                            st.session_state.ls_dcode = None
-                            st.warning("⚠️ No D-Code found in data")
-                    else:
-                        # Oval: Auto-select LS D-Code as the one with smaller avg rollout
-                        if len(dcodes) >= 2:
-                            avg_rollouts = {d: df[df['D-Code'] == d]['Rollout/Dia'].mean() for d in dcodes}
-                            st.session_state.ls_dcode = min(avg_rollouts, key=avg_rollouts.get)
-
-                            st.caption(
-                                f"ℹ️ Auto-selected LS D-Code: {st.session_state.ls_dcode} "
-                                f"(smaller avg rollout: {avg_rollouts[st.session_state.ls_dcode]:.1f}\")"
-                            )
-                        elif len(dcodes) == 1:
-                            # Only 1 D-Code but in Oval mode → Warning already shown by detect_track_type()
-                            st.session_state.ls_dcode = dcodes[0]
-                        else:
-                            st.session_state.ls_dcode = None
-                            st.warning("⚠️ No D-Codes found in data")
+                        st.session_state.ls_dcode = None
 
                     # Set default stagger target
                     if st.session_state.ls_dcode is not None:
@@ -1831,60 +1717,14 @@ with tab_settings:
                 dcodes = sorted(df['D-Code'].unique().tolist())
                 st.session_state.available_dcodes = dcodes
 
-                # Auto-detect track type from D-Code distribution
-                detected_type, type_warnings = detect_track_type(df)
-                st.session_state.track_type = detected_type
-
-                # Display detected track type with visual indicator
-                if detected_type == 'Road Course':
-                    if dcodes:
-                        st.info(
-                            f"🏁 **Detected: Road Course** (all tires have same D-Code: {dcodes[0]})\n\n"
-                            f"Tire pool assignment: Using Wheel column (A-wheels → LR/RF, non-A → LF/RR)"
-                        )
-                    else:
-                        st.info(f"🏁 **Detected: Road Course**")
+                # Auto-select LS D-Code as the one with smaller avg rollout
+                if len(dcodes) >= 2:
+                    avg_rollouts = {d: df[df['D-Code'] == d]['Rollout/Dia'].mean() for d in dcodes}
+                    st.session_state.ls_dcode = min(avg_rollouts, key=avg_rollouts.get)
+                elif dcodes:
+                    st.session_state.ls_dcode = dcodes[0]
                 else:
-                    # Oval mode
-                    dcode_counts = df['D-Code'].value_counts()
-                    if len(dcode_counts) >= 2:
-                        st.info(
-                            f"🔄 **Detected: Oval** (two D-Code groups: {dcode_counts.index[0]} = {dcode_counts.values[0]} tires, "
-                            f"{dcode_counts.index[1]} = {dcode_counts.values[1]} tires)\n\n"
-                            f"Tire pool assignment: LS D-Code → LF/LR, other D-Code → RF/RR"
-                        )
-                    else:
-                        st.info(f"🔄 **Detected: Oval**")
-
-                # Display warnings if any
-                if type_warnings:
-                    for warning in type_warnings:
-                        st.warning(warning)
-
-                # Auto-select LS D-Code based on track type
-                if st.session_state.track_type == 'Road Course':
-                    # Road Course: All tires have same D-Code, so just pick the only one
-                    if len(dcodes) >= 1:
-                        st.session_state.ls_dcode = dcodes[0]
-                    else:
-                        st.session_state.ls_dcode = None
-                        st.warning("⚠️ No D-Code found in data")
-                else:
-                    # Oval: Auto-select LS D-Code as the one with smaller avg rollout
-                    if len(dcodes) >= 2:
-                        avg_rollouts = {d: df[df['D-Code'] == d]['Rollout/Dia'].mean() for d in dcodes}
-                        st.session_state.ls_dcode = min(avg_rollouts, key=avg_rollouts.get)
-
-                        st.caption(
-                            f"ℹ️ Auto-selected LS D-Code: {st.session_state.ls_dcode} "
-                            f"(smaller avg rollout: {avg_rollouts[st.session_state.ls_dcode]:.1f}\")"
-                        )
-                    elif len(dcodes) == 1:
-                        # Only 1 D-Code but in Oval mode → Warning already shown by detect_track_type()
-                        st.session_state.ls_dcode = dcodes[0]
-                    else:
-                        st.session_state.ls_dcode = None
-                        st.warning("⚠️ No D-Codes found in data")
+                    st.session_state.ls_dcode = None
 
                 # Set default stagger target
                 if st.session_state.ls_dcode is not None:
@@ -1900,13 +1740,15 @@ with tab_settings:
     with left_setup_col:
         st.divider()
 
-        # --- Track Type Section (Auto-Detected, Read-Only) ---
-        if st.session_state.data_loaded and st.session_state.tire_df is not None:
-            st.markdown("**Track Type (Auto-Detected)**")
-            if st.session_state.track_type == 'Road Course':
-                st.markdown("🏁 **Road Course** - Using Wheel column for tire pools")
-            else:
-                st.markdown("🔄 **Oval** - Using D-Code for tire pools")
+        # --- Track Type Section ---
+        track_type = st.radio(
+            "Track Type",
+            options=['Oval', 'Road Course'],
+            index=0 if st.session_state.track_type == 'Oval' else 1,
+            horizontal=True,
+            key='track_type_selector'
+        )
+        st.session_state.track_type = track_type
 
         st.divider()
 
@@ -1915,7 +1757,7 @@ with tab_settings:
             st.markdown("### Tire Setup")
             df = st.session_state.tire_df
 
-            if st.session_state.track_type == 'Oval':
+            if track_type == 'Oval':
                 # Show D-Code selector for Oval
                 dcodes = st.session_state.available_dcodes
                 if dcodes and len(dcodes) >= 2:
@@ -1936,15 +1778,15 @@ with tab_settings:
                     st.session_state.left_tires = pd.DataFrame()
                     st.session_state.right_tires = pd.DataFrame()
                 else:
-                    a_pool, non_a_pool = assign_positions(df, '', track_type=st.session_state.track_type)
+                    a_pool, non_a_pool = assign_positions(df, '', track_type='Road Course')
                     st.session_state.left_tires = a_pool
                     st.session_state.right_tires = non_a_pool
                     st.caption(f"'A' Wheels (LR/RF): **{len(a_pool)}** tires")
                     st.caption(f"Non-A Wheels (LF/RR): **{len(non_a_pool)}** tires")
 
             # Update tire pools for Oval
-            if st.session_state.track_type == 'Oval' and st.session_state.ls_dcode:
-                left, right = assign_positions(df, st.session_state.ls_dcode, track_type=st.session_state.track_type)
+            if track_type == 'Oval' and st.session_state.ls_dcode:
+                left, right = assign_positions(df, st.session_state.ls_dcode, track_type='Oval')
                 st.session_state.left_tires = left
                 st.session_state.right_tires = right
 
@@ -1969,7 +1811,7 @@ with tab_settings:
                 st.divider()
 
                 # --- Controls ---
-                if st.session_state.get('track_type', 'Oval') == 'Road Course':
+                if track_type == 'Road Course':
                     st.session_state.target_stagger = 0.0
                     st.caption("Road Course — stagger locked to **0**")
                 else:
@@ -2024,7 +1866,7 @@ with tab_settings:
 
                 status_text.text("Building candidates...")
 
-                is_road = st.session_state.track_type == 'Road Course'
+                is_road = track_type == 'Road Course'
                 if is_road:
                     candidates = build_candidates_road(
                         left, right,
@@ -2154,61 +1996,8 @@ with tab_results:
         </style>
         """, unsafe_allow_html=True)
 
-        # --- Compact styling for Results page ---
-        st.markdown("""
-        <style>
-        /* Kill all vertical spacing */
-
-        /* No space after tabs */
-        .stTabs [data-baseweb="tab-panel"] {
-            padding: 0 !important;
-        }
-
-        /* Compact buttons */
-        [data-testid="stHorizontalBlock"] button {
-            padding: 0.1rem 0.5rem !important;
-            font-size: 0.75rem !important;
-            min-height: 1.3rem !important;
-            height: 1.5rem !important;
-            line-height: 1.1 !important;
-        }
-
-        /* No spacing on button row */
-        [data-testid="stHorizontalBlock"] {
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-
-        /* Kill all element spacing */
-        [data-testid="element-container"] {
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-
-        /* Kill vertical block spacing */
-        [data-testid="stVerticalBlock"] > * {
-            margin: 0 !important;
-            padding-top: 0 !important;
-            padding-bottom: 0 !important;
-        }
-
-        /* Kill main container top padding */
-        .main .block-container {
-            padding-top: 0 !important;
-        }
-
-        /* Minimal tire set spacing */
-        [data-testid="stVerticalBlockBorderWrapper"] {
-            margin-top: 0.2rem !important;
-            margin-bottom: 0.2rem !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
         # --- Refine toolbar ---
         rate_pref = st.session_state.rate_preference
-
-        # 7 refine buttons
         btn_row = st.columns(7)
 
         with btn_row[0]:
@@ -2226,6 +2015,20 @@ with tab_results:
         with btn_row[6]:
             stiffest_first_clicked = st.button("Stiffest First", use_container_width=True, help="Sort sets by average rate (stiffest to softest)")
 
+        # --- Locked/Unlocked Stats Display ---
+        if st.session_state.import_mode == 'Add Sets to Existing':
+            locked_count = len(st.session_state.locked_sets)
+            total_count = len(solution)
+            unlocked_count = total_count - locked_count
+
+            st.markdown(
+                f"<div style='text-align:center;padding:6px;background:#e3f2fd;border-radius:6px;margin-bottom:6px;margin-top:4px;'>"
+                f"🔒 <b>Locked:</b> {locked_count} sets &nbsp;|&nbsp; "
+                f"🔓 <b>Unlocked:</b> {unlocked_count} sets &nbsp;|&nbsp; "
+                f"📊 <b>Total:</b> {total_count} sets"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
         # --- Helper to update stats after refinement ---
         def _update_stats(solution):
@@ -2294,7 +2097,6 @@ with tab_results:
             st.session_state.results = solution_sorted
             _update_stats(solution_sorted)
             st.toast("Sets sorted: Softest to Stiffest")
-            st.query_params.clear()
             st.rerun()
 
         if stiffest_first_clicked:
@@ -2303,7 +2105,6 @@ with tab_results:
             st.session_state.results = solution_sorted
             _update_stats(solution_sorted)
             st.toast("Sets sorted: Stiffest to Softest")
-            st.query_params.clear()
             st.rerun()
 
         selected = st.session_state.selected_tire
@@ -2599,118 +2400,125 @@ with tab_results:
                                                 st.toast(f"Can't swap {from_corner} with {corner} — different pools")
                                         st.rerun()
 
-        # --- Export Section ---
+        def export_solution_to_csv(solution: List[dict]) -> str:
+            """Export solution to CSV with set assignments for Add Sets workflow.
+
+            CSV Format:
+            Set,Corner,Number,D-Code,Rollout/Dia,Rate,Shift,Date Code,Wheel
+            1,LF,45,2034,2054.5,750,B,3923,3A
+            1,RF,82,2035,2079.5,800,B,3923,4
+            ...
+            """
+            rows = []
+
+            for set_idx, s in enumerate(solution):
+                for corner, corner_key in [('LF', 'lf_data'), ('RF', 'rf_data'),
+                                            ('LR', 'lr_data'), ('RR', 'rr_data')]:
+                    tire = s[corner_key]
+                    row = {'Set': set_idx + 1, 'Corner': corner}
+
+                    # Add all tire attributes from original data
+                    for col in tire.index:
+                        row[col] = tire[col]
+
+                    rows.append(row)
+
+            df = pd.DataFrame(rows)
+            return df.to_csv(index=False)
+
         st.divider()
 
-        # Nice styled header
-        st.markdown("""
-        <div style='background: linear-gradient(90deg, #1f77b4 0%, #42a5f5 100%);
-                    padding: 1rem; border-radius: 0.5rem; margin-bottom: 1.5rem;'>
-            <h3 style='color: white; margin: 0; font-size: 1.5rem;'>📤 Export Data</h3>
-        </div>
-        """, unsafe_allow_html=True)
+        # --- Export Data ---
+        st.markdown("### Export Data")
 
-        export_col1, export_col2 = st.columns(2, gap="large")
+        export_col1, export_col2 = st.columns(2)
 
-        # Left column - Copy IDs
         with export_col1:
-            with st.container(border=True):
-                st.markdown("### 📋 Copy Tire IDs")
-                st.caption("Quick reference for tire numbers")
+            st.markdown("**Quick Reference** (tire numbers only)")
 
-                sample_tire = solution[0]['lf_data']
-                id_col = None
-                for candidate in ['Number', 'number', 'Seq#', 'ID', 'Ref', 'Tire Number', 'Tire_Number']:
-                    if candidate in sample_tire.index:
-                        id_col = candidate
-                        break
+            # --- Copy Tire Numbers to Clipboard ---
+            # Detect the tire ID column name (Number, Seq#, ID, etc.)
+            sample_tire = solution[0]['lf_data']
+            id_col = None
+            for candidate in ['Number', 'number', 'Seq#', 'ID', 'Ref', 'Tire Number', 'Tire_Number']:
+                if candidate in sample_tire.index:
+                    id_col = candidate
+                    break
 
-                if id_col:
-                    clip_rows = []
-                    for idx, s in enumerate(solution):
-                        lf_num = int(s['lf_data'][id_col])
-                        rf_num = int(s['rf_data'][id_col])
-                        lr_num = int(s['lr_data'][id_col])
-                        rr_num = int(s['rr_data'][id_col])
-                        if idx > 0:
-                            clip_rows.append("")
-                        clip_rows.append(f"{lf_num}\t{rf_num}")
-                        clip_rows.append(f"{lr_num}\t{rr_num}")
-                    clip_text = "\n".join(clip_rows)
+            if id_col is None:
+                st.warning(f"Could not find tire ID column. Available columns: {list(sample_tire.index)}")
+            else:
+                # Build 2-column clipboard text: Left | Right per row
+                # Each set = 2 rows: LF/RF then LR/RR, ordered by set number
+                clip_rows = []
+                for idx, s in enumerate(solution):
+                    lf_num = int(s['lf_data'][id_col])
+                    rf_num = int(s['rf_data'][id_col])
+                    lr_num = int(s['lr_data'][id_col])
+                    rr_num = int(s['rr_data'][id_col])
+                    if idx > 0:
+                        clip_rows.append("")  # blank row between sets
+                    clip_rows.append(f"{lf_num}\t{rf_num}")
+                    clip_rows.append(f"{lr_num}\t{rr_num}")
+                clip_text = "\n".join(clip_rows)
 
-                    with st.expander("👁️ Preview", expanded=False):
-                        st.code(clip_text, language=None)
+                # JavaScript clipboard copy button
+                escaped = clip_text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+                copy_js = f"""
+                <button onclick="navigator.clipboard.writeText(`{escaped}`).then(()=>{{this.innerText='Copied!';setTimeout(()=>this.innerText='Copy Tire Numbers to Clipboard',2000)}})"
+                        style="width:100%;padding:10px 20px;font-size:16px;font-weight:600;
+                               background:#2e7d32;color:white;border:none;border-radius:8px;
+                               cursor:pointer;">
+                        Copy Tire Numbers to Clipboard
+                </button>
+                """
+                components.html(copy_js, height=50)
 
-                    # Styled copy button
-                    escaped = clip_text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
-                    copy_button = f"""
-                    <button onclick="navigator.clipboard.writeText(`{escaped}`).then(()=>{{
-                        this.innerHTML='✅ Copied!';
-                        this.style.background='#388e3c';
-                        setTimeout(()=>{{
-                            this.innerHTML='📋 Copy to Clipboard';
-                            this.style.background='#2e7d32';
-                        }}, 2000);
-                    }})"
-                            style="width:100%;padding:0.75rem 1.5rem;margin-top:0.5rem;
-                                   font-size:1rem;font-weight:600;
-                                   background:#2e7d32;color:white;border:none;
-                                   border-radius:0.5rem;cursor:pointer;
-                                   transition: all 0.3s ease;
-                                   box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                            📋 Copy to Clipboard
-                    </button>
-                    """
-                    components.html(copy_button, height=70)
-
-        # Right column - Download CSV
-        with export_col2:
-            with st.container(border=True):
-                st.markdown("### 💾 Download CSV")
-                st.caption("Full data with Set/Corner assignments")
-
-                def export_solution_to_csv_inline(solution: List[dict]) -> str:
-                    rows = []
-                    for set_idx, s in enumerate(solution):
-                        for corner, corner_key in [('LF', 'lf_data'), ('RF', 'rf_data'),
-                                                    ('LR', 'lr_data'), ('RR', 'rr_data')]:
-                            tire = s[corner_key]
-                            row = {'Set': set_idx + 1, 'Corner': corner}
-                            for col in tire.index:
-                                row[col] = tire[col]
-                            rows.append(row)
-                    return pd.DataFrame(rows).to_csv(index=False)
-
-                csv_data = export_solution_to_csv_inline(solution)
-                original_name = st.session_state.get('original_filename', 'TireData')
-                if original_name is None or not original_name:
-                    base_name = 'TireData'
-                else:
-                    if '.' in original_name:
-                        base_name = original_name.rsplit('.', 1)[0]
-                    else:
-                        base_name = original_name
-                    import re
-                    base_name = re.sub(r'[-_\s]*unsorted[-_\s]*', '', base_name, flags=re.IGNORECASE)
-                    base_name = re.sub(r'[-_]{2,}', '-', base_name).strip('-_')
-
-                export_filename = f"SORTED-SETS-1-{len(solution)}-{base_name}.csv"
-
-                st.markdown(f"""
-                <div style='background:#f0f2f6;padding:0.75rem;border-radius:0.25rem;margin:0.5rem 0;'>
-                    <strong>📊 {len(solution)} sets</strong><br>
-                    <small style='color:#666;'>File: {export_filename}</small>
-                </div>
-                """, unsafe_allow_html=True)
-
+            with st.expander("View / Download"):
+                st.code(clip_text, language=None)
                 st.download_button(
-                    "📥 Download CSV File",
-                    data=csv_data,
-                    file_name=export_filename,
-                    mime="text/csv",
-                    use_container_width=True,
-                    type="primary"
+                    "Download as TXT",
+                    data=clip_text,
+                    file_name="tire_numbers.txt",
+                    mime="text/plain",
+                    use_container_width=True
                 )
+
+        with export_col2:
+            st.markdown("**Full Export** (for Add Sets workflow)")
+            csv_data = export_solution_to_csv(solution)
+
+            # Generate filename: SORTED-SETS-X-original_filename.csv
+            original_name = st.session_state.get('original_filename', 'TireData')
+
+            # Handle None case
+            if original_name is None:
+                base_name = 'TireData'
+            else:
+                # Strip extension from original filename
+                if '.' in original_name:
+                    base_name = original_name.rsplit('.', 1)[0]
+                else:
+                    base_name = original_name
+
+                # Remove "unsorted" from filename (case-insensitive)
+                import re
+                base_name = re.sub(r'[-_\s]*unsorted[-_\s]*', '', base_name, flags=re.IGNORECASE)
+                # Clean up any double dashes/underscores that might result
+                base_name = re.sub(r'[-_]{2,}', '-', base_name)
+                # Remove trailing/leading dashes or underscores
+                base_name = base_name.strip('-_')
+
+            export_filename = f"SORTED-SETS-1-{len(solution)}-{base_name}.csv"
+
+            st.download_button(
+                "📥 Download CSV with Set Assignments",
+                data=csv_data,
+                file_name=export_filename,
+                mime="text/csv",
+                use_container_width=True
+            )
+            st.caption("💡 Use this file to add more sets later")
 
     else:
         st.info("Configure settings in **Setup & Sort**, then run the sort.")
