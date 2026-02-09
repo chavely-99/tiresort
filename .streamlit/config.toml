@@ -1,0 +1,18 @@
+# Streamlit Configuration for TRK Tire Sorter
+
+[server]
+# Increase max upload size to 200 MB for Excel files
+maxUploadSize = 200
+
+# Optional: Increase message size for large data transfers
+maxMessageSize = 200
+
+[theme]
+primaryColor = "#FF6B35"  # Trackhouse orange
+backgroundColor = "#0F1419"
+secondaryBackgroundColor = "#1E2329"
+textColor = "#FFFFFF"
+
+[browser]
+# Automatically gather usage stats
+gatherUsageStats = false
