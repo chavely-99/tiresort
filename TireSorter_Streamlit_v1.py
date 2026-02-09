@@ -251,7 +251,6 @@ SS_DEFAULTS = {
     'import_mode': 'Initial Import',  # 'Initial Import' or 'Add Sets to Existing'
     'locked_sets': set(),              # Set of indices (0-based) that are locked
     'existing_tire_numbers': set(),    # Tire Numbers from locked sets
-    'original_filename': None,         # Original Excel filename for CSV export naming
 }
 
 def ss_init():
@@ -366,76 +365,71 @@ def load_tire_data(file_source) -> pd.DataFrame:
     return df
 
 
-def load_tire_data_from_two_files(csv_file_source, excel_file_source) -> Tuple[pd.DataFrame, Optional[List[dict]]]:
-    """Load tire data from TWO files: CSV with previous sort + Excel with all available tires.
+def load_tire_data_with_sets(file_source) -> Tuple[pd.DataFrame, Optional[List[dict]]]:
+    """Load tire data that includes Set/Corner columns from previous export.
 
-    Workflow:
-    1. Load CSV (previous sort results) - extract Set/Corner/Number assignments
-    2. Load Excel (all available tires) - complete tire data including new ones
-    3. Match tire Numbers from CSV to Excel to reconstruct existing sets with full tire data
-    4. Return all tires from Excel and reconstructed existing sets
+    Supports both formats:
+    - CSV: All rows have Set/Corner columns
+    - Excel/CSV mixed: Some rows have Set/Corner (existing), some don't (new)
 
     Returns:
         (all_tire_df, existing_sets):
-            - all_tire_df: All tires from Excel file
-            - existing_sets: List of set dicts for locked sets, reconstructed from CSV + Excel match
+            - all_tire_df: All tires including new ones
+            - existing_sets: List of set dicts for locked sets, or None if not found
     """
-    # Load CSV file (previous sort results)
+    # Detect file type and read
     try:
-        if hasattr(csv_file_source, 'name') and csv_file_source.name.endswith('.csv'):
-            csv_df = pd.read_csv(csv_file_source)
+        if hasattr(file_source, 'name') and file_source.name.endswith('.csv'):
+            df = pd.read_csv(file_source)
         else:
-            raise ValueError("Previous sort file must be CSV format")
+            # Try Excel format first (standard scan data sheets)
+            df = load_tire_data(file_source)
+
+            # If standard load worked but no Set column, return as-is
+            if 'Set' not in df.columns:
+                return df, None
     except Exception as e:
-        raise ValueError(f"Failed to load CSV file: {e}")
+        st.error(f"Failed to load file: {e}")
+        return pd.DataFrame(), None
 
-    # Validate CSV has required columns
-    if 'Set' not in csv_df.columns or 'Corner' not in csv_df.columns or 'Number' not in csv_df.columns:
-        raise ValueError("CSV file must contain 'Set', 'Corner', and 'Number' columns from previous export")
+    # Check if Set/Corner columns exist
+    if 'Set' not in df.columns or 'Corner' not in df.columns:
+        # No set data - treat as initial import
+        return df, None
 
-    # Load Excel file (all available tires)
-    try:
-        excel_df = load_tire_data(excel_file_source)
-    except Exception as e:
-        raise ValueError(f"Failed to load Excel file: {e}")
+    # Split into existing sets (has Set value) and new tires (Set is NaN)
+    has_set = df['Set'].notna()
+    existing_df = df[has_set].copy()
+    new_df = df[~has_set].copy()
 
-    if 'Number' not in excel_df.columns:
-        raise ValueError("Excel file must contain 'Number' column")
+    if len(existing_df) == 0:
+        # No existing sets found
+        return df.drop(['Set', 'Corner'], axis=1, errors='ignore'), None
 
-    # Reconstruct existing sets by matching CSV assignments to Excel tire data
+    # Reconstruct existing sets from rows with Set/Corner
     existing_sets = []
-    csv_tire_numbers = set()
+    for set_num in sorted(existing_df['Set'].unique()):
+        set_df = existing_df[existing_df['Set'] == set_num]
 
-    for set_num in sorted(csv_df['Set'].unique()):
-        set_rows = csv_df[csv_df['Set'] == set_num]
+        if len(set_df) != 4:
+            raise ValueError(f"Set {set_num} has {len(set_df)} tires, expected 4 (need LF, RF, LR, RR)")
 
-        if len(set_rows) != 4:
-            raise ValueError(f"CSV Set {set_num} has {len(set_rows)} tires, expected 4 (LF, RF, LR, RR)")
-
-        # Build set dictionary by matching tire Numbers from CSV to Excel
+        # Build set dictionary matching solution format
         corners = {}
-        for _, row in set_rows.iterrows():
+        for _, row in set_df.iterrows():
             corner = row['Corner'].upper()
             if corner not in ['LF', 'RF', 'LR', 'RR']:
-                raise ValueError(f"Invalid corner '{corner}' in CSV Set {set_num}")
+                raise ValueError(f"Invalid corner '{corner}' in Set {set_num}")
 
-            tire_num = int(row['Number'])
-            csv_tire_numbers.add(tire_num)
-
-            # Find this tire in Excel data
-            matching_tires = excel_df[excel_df['Number'] == tire_num]
-            if len(matching_tires) == 0:
-                raise ValueError(f"Tire #{tire_num} from CSV Set {set_num} not found in Excel file")
-
-            # Use tire data from Excel (most current scan)
-            tire_data = matching_tires.iloc[0].copy()
+            # Convert row to Series (drop Set, Corner columns)
+            tire_data = row.drop(['Set', 'Corner'], errors='ignore')
             corners[f"{corner.lower()}_data"] = tire_data
 
         # Validate all 4 corners present
         required = {'lf_data', 'rf_data', 'lr_data', 'rr_data'}
         if set(corners.keys()) != required:
             missing = required - set(corners.keys())
-            raise ValueError(f"CSV Set {set_num} missing corners: {missing}")
+            raise ValueError(f"Set {set_num} missing corners: {missing}")
 
         # Compute metrics for this set
         metrics = compute_set_metrics(
@@ -446,8 +440,16 @@ def load_tire_data_from_two_files(csv_file_source, excel_file_source) -> Tuple[p
         set_dict = {**corners, **metrics}
         existing_sets.append(set_dict)
 
-    # Return all tires from Excel (for pool assignment) and reconstructed sets
-    return excel_df, existing_sets
+    # Combine all tires for pool assignment (remove Set/Corner columns)
+    all_tires = pd.concat([
+        existing_df.drop(['Set', 'Corner'], axis=1, errors='ignore'),
+        new_df.drop(['Set', 'Corner'], axis=1, errors='ignore')
+    ], ignore_index=True)
+
+    # Remove duplicates (existing tires might appear twice)
+    all_tires = all_tires.drop_duplicates(subset=['Number'], keep='first').reset_index(drop=True)
+
+    return all_tires, existing_sets
 
 
 def validate_existing_sets(existing_sets: List[dict], all_tire_df: pd.DataFrame) -> Tuple[bool, List[str]]:
@@ -1564,52 +1566,22 @@ with tab_settings:
 
         st.divider()
 
-        # Conditional file uploaders based on import mode
-        if st.session_state.import_mode == 'Add Sets to Existing':
-            # TWO-FILE WORKFLOW for Add Sets mode
-            st.caption("📋 **Step 1:** Upload previous sort results (CSV)")
-            csv_file = st.file_uploader(
-                "Previous Sort CSV",
-                type=['csv'],
-                help="CSV file exported from initial sort with Set/Corner/Number columns",
-                key='csv_uploader'
-            )
+        uploaded_file = st.file_uploader(
+            "Upload Excel File",
+            type=['xlsx', 'xlsm', 'xls'],
+            help="Excel file with Scan Data sheet"
+        )
 
-            st.caption("📊 **Step 2:** Upload all available tires (Excel)")
-            excel_file = st.file_uploader(
-                "All Available Tires Excel",
-                type=['xlsx', 'xlsm', 'xls'],
-                help="Excel file with complete tire inventory (Scan Data sheet)",
-                key='excel_uploader'
-            )
-
-            uploaded_file = None  # Not used in Add Sets mode
-            both_files_uploaded = csv_file is not None and excel_file is not None
-
-        else:
-            # SINGLE-FILE WORKFLOW for Initial Import mode
-            uploaded_file = st.file_uploader(
-                "Upload Excel File",
-                type=['xlsx', 'xlsm', 'xls'],
-                help="Excel file with Scan Data sheet"
-            )
-            csv_file = None
-            excel_file = None
-            both_files_uploaded = False
-
-    # Process files based on import mode
-    if st.session_state.import_mode == 'Add Sets to Existing':
-        if both_files_uploaded:
-            # Create unique token from both files
-            token = (csv_file.name, csv_file.size, excel_file.name, excel_file.size)
-
-            if st.session_state._upload_token != token:
-                try:
-                    # ADD SETS MODE: Load TWO files (CSV + Excel)
-                    all_tire_df, existing_sets = load_tire_data_from_two_files(csv_file, excel_file)
+    if uploaded_file is not None:
+        token = (uploaded_file.name, uploaded_file.size)
+        if st.session_state._upload_token != token:
+            try:
+                if st.session_state.import_mode == 'Add Sets to Existing':
+                    # ADD SETS MODE: Load file with set assignments
+                    all_tire_df, existing_sets = load_tire_data_with_sets(uploaded_file)
 
                     if existing_sets is None or len(existing_sets) == 0:
-                        st.error("❌ No existing sets found in CSV. CSV must contain Set/Corner/Number columns from previous export.")
+                        st.error("❌ No existing sets found in file. File must contain 'Set' and 'Corner' columns with existing tire assignments. Use 'Initial Import' mode for fresh data.")
                         st.stop()
 
                     # Validate existing sets
@@ -1629,13 +1601,13 @@ with tab_settings:
                                 st.warning(w)
 
                     # Success message
-                    st.success(f"✓ Validated {len(existing_sets)} existing sets from CSV")
+                    st.success(f"✓ Validated {len(existing_sets)} existing sets")
 
                     # Filter to new tires only
                     new_tires_df = filter_new_tires(all_tire_df, existing_sets)
 
                     if len(new_tires_df) == 0:
-                        st.error("❌ No new tires found to sort. All tires in Excel are already in CSV sets.")
+                        st.error("❌ No new tires found to sort. All tires in file are already assigned to existing sets.")
                         st.stop()
 
                     st.info(f"📦 Found {len(new_tires_df)} new tires to sort into additional sets")
@@ -1658,60 +1630,27 @@ with tab_settings:
                     st.session_state._upload_token = token
                     st.session_state.data_loaded = True
 
-                    # Store original Excel filename for export naming
-                    st.session_state.original_filename = excel_file.name
+                else:
+                    # INITIAL IMPORT MODE: Standard workflow
+                    df = load_tire_data(uploaded_file)
+                    st.session_state.tire_df = df
+                    st.session_state._upload_token = token
+                    st.session_state.data_loaded = True
 
-                    # Common post-import logic
-                    dcodes = sorted(df['D-Code'].unique().tolist())
-                    st.session_state.available_dcodes = dcodes
+                    # Clear locked sets and existing results
+                    st.session_state.results = None
+                    st.session_state.locked_sets = set()
+                    st.session_state.existing_tire_numbers = set()
 
-                    # Auto-select LS D-Code as the one with smaller avg rollout
-                    if len(dcodes) >= 2:
-                        avg_rollouts = {d: df[df['D-Code'] == d]['Rollout/Dia'].mean() for d in dcodes}
-                        st.session_state.ls_dcode = min(avg_rollouts, key=avg_rollouts.get)
-                    elif dcodes:
-                        st.session_state.ls_dcode = dcodes[0]
-                    else:
-                        st.session_state.ls_dcode = None
+                    # Check for duplicates
+                    dup_warnings = detect_input_duplicates(df)
+                    st.session_state.duplicate_warnings = dup_warnings
 
-                    # Set default stagger target
-                    if st.session_state.ls_dcode is not None:
-                        _left, _right = assign_positions(df, st.session_state.ls_dcode)
-                        _sa = analyze_stagger_range(_left, _right)
-                        st.session_state.target_stagger = float(_sa['max_all_sets'])
+                    if dup_warnings:
+                        for warning in dup_warnings:
+                            st.warning(warning)
 
-                except Exception as e:
-                    st.error(f"Error loading files: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
-
-    elif uploaded_file is not None:
-        # INITIAL IMPORT MODE: Standard single-file workflow
-        token = (uploaded_file.name, uploaded_file.size)
-        if st.session_state._upload_token != token:
-            try:
-                df = load_tire_data(uploaded_file)
-                st.session_state.tire_df = df
-                st.session_state._upload_token = token
-                st.session_state.data_loaded = True
-
-                # Store original filename for export naming
-                st.session_state.original_filename = uploaded_file.name
-
-                # Clear locked sets and existing results
-                st.session_state.results = None
-                st.session_state.locked_sets = set()
-                st.session_state.existing_tire_numbers = set()
-
-                # Check for duplicates
-                dup_warnings = detect_input_duplicates(df)
-                st.session_state.duplicate_warnings = dup_warnings
-
-                if dup_warnings:
-                    for warning in dup_warnings:
-                        st.warning(warning)
-
-                st.success(f"Loaded {len(df)} tires")
+                    st.success(f"Loaded {len(df)} tires")
 
                 # Common post-import logic (for both modes)
                 dcodes = sorted(df['D-Code'].unique().tolist())
@@ -1981,21 +1920,6 @@ with tab_results:
             for warning in sol_warnings:
                 st.error(warning)
 
-        # --- Reduce spacing in Results tab ---
-        st.markdown("""
-        <style>
-        /* Reduce spacing between refine buttons and content below */
-        div[data-testid="column"] > div {
-            padding-top: 0.3rem !important;
-            padding-bottom: 0.3rem !important;
-        }
-        /* Reduce gap between rows of sets */
-        div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] {
-            gap: 0.5rem !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
         # --- Refine toolbar ---
         rate_pref = st.session_state.rate_preference
         btn_row = st.columns(7)
@@ -2022,7 +1946,7 @@ with tab_results:
             unlocked_count = total_count - locked_count
 
             st.markdown(
-                f"<div style='text-align:center;padding:6px;background:#e3f2fd;border-radius:6px;margin-bottom:6px;margin-top:4px;'>"
+                f"<div style='text-align:center;padding:8px;background:#e3f2fd;border-radius:6px;margin-bottom:8px;margin-top:8px;'>"
                 f"🔒 <b>Locked:</b> {locked_count} sets &nbsp;|&nbsp; "
                 f"🔓 <b>Unlocked:</b> {unlocked_count} sets &nbsp;|&nbsp; "
                 f"📊 <b>Total:</b> {total_count} sets"
@@ -2049,7 +1973,6 @@ with tab_results:
             success, msg = refine_cross(solution, st.session_state.cross_target, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
-                st.session_state.results = solution  # Save changes!
                 st.toast(f"Cross refined: {msg}")
                 st.rerun()
             else:
@@ -2059,7 +1982,6 @@ with tab_results:
             success, msg = refine_shift(solution, st.session_state.cross_target, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
-                st.session_state.results = solution  # Save changes!
                 st.toast(f"Shift refined: {msg}")
                 st.rerun()
             else:
@@ -2069,7 +1991,6 @@ with tab_results:
             success, msg = refine_date(solution, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
-                st.session_state.results = solution  # Save changes!
                 st.toast(f"Date refined: {msg}")
                 st.rerun()
             else:
@@ -2079,8 +2000,7 @@ with tab_results:
             success, msg = refine_rr_rollout(solution, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
-                solution = sort_by_rr_rollout(solution)  # Sort and update local
-                st.session_state.results = solution  # Save changes!
+                st.session_state.results = sort_by_rr_rollout(solution)
                 st.toast(f"RR refined: {msg}")
                 st.rerun()
             else:
@@ -2090,7 +2010,6 @@ with tab_results:
             success, msg = refine_rate(solution, rate_pref, stagger_tol, road_course=is_road)
             if success:
                 _update_stats(solution)
-                st.session_state.results = solution  # Save changes!
                 st.toast(f"Rate refined: {msg}")
                 st.rerun()
             else:
@@ -2492,34 +2411,10 @@ with tab_results:
         with export_col2:
             st.markdown("**Full Export** (for Add Sets workflow)")
             csv_data = export_solution_to_csv(solution)
-
-            # Generate filename: SORTED-SETS-X-original_filename.csv
-            original_name = st.session_state.get('original_filename', 'TireData')
-
-            # Handle None case
-            if original_name is None:
-                base_name = 'TireData'
-            else:
-                # Strip extension from original filename
-                if '.' in original_name:
-                    base_name = original_name.rsplit('.', 1)[0]
-                else:
-                    base_name = original_name
-
-                # Remove "unsorted" from filename (case-insensitive)
-                import re
-                base_name = re.sub(r'[-_\s]*unsorted[-_\s]*', '', base_name, flags=re.IGNORECASE)
-                # Clean up any double dashes/underscores that might result
-                base_name = re.sub(r'[-_]{2,}', '-', base_name)
-                # Remove trailing/leading dashes or underscores
-                base_name = base_name.strip('-_')
-
-            export_filename = f"SORTED-SETS-1-{len(solution)}-{base_name}.csv"
-
             st.download_button(
                 "📥 Download CSV with Set Assignments",
                 data=csv_data,
-                file_name=export_filename,
+                file_name=f"tire_sets_{len(solution)}_sets.csv",
                 mime="text/csv",
                 use_container_width=True
             )
