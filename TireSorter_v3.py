@@ -56,7 +56,7 @@ st.set_page_config(
     page_title=APP_TITLE,
     page_icon="\U0001F3CE",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ============================================================
@@ -67,7 +67,7 @@ st.markdown("""
 <style>
 /* Tighten up default Streamlit padding */
 .block-container { padding-top: 1rem; padding-bottom: 0.5rem; }
-section[data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
+section[data-testid="stSidebar"] { display: none; }
 header[data-testid="stHeader"] { height: 0; min-height: 0; padding: 0; }
 .stTabs [data-baseweb="tab-list"] { gap: 2px; margin-bottom: 0.25rem; }
 
@@ -1072,13 +1072,18 @@ def render_set_card(set_idx: int, metrics: dict, lefts, rights, lp, rp,
 # ============================================================
 
 def main():
-    # ---- Sidebar: File Upload & Configuration ----
-    with st.sidebar:
-        st.header("Data Import")
+    # ---- Tabs ----
+    tab_config, tab_results = st.tabs(["Configure", "Results"])
+
+    # ================================================================
+    # CONFIGURE TAB
+    # ================================================================
+    with tab_config:
+        # ---- File Upload ----
         uploaded = st.file_uploader(
             "Upload tire scan workbook",
             type=["xlsm", "xlsx", "xls"],
-            help="Excel workbook with a 'Scan Data' sheet"
+            help="Excel workbook with a 'Scan Data' sheet",
         )
 
         if uploaded:
@@ -1133,17 +1138,9 @@ def main():
                 elif tires is not None:
                     st.error(f"Only {len(tires)} tires found — need at least 4.")
 
-    if not st.session_state.data_loaded:
-        st.info("Upload an Excel tire scan workbook to get started.")
-        return
-
-    # ---- Tabs ----
-    tab_config, tab_results = st.tabs(["Configure", "Results"])
-
-    # ================================================================
-    # CONFIGURE TAB
-    # ================================================================
-    with tab_config:
+        if not st.session_state.data_loaded:
+            st.info("Upload an Excel tire scan workbook to get started.")
+            return
         tires = st.session_state.tire_df
         lefts = st.session_state.lefts
         rights = st.session_state.rights
