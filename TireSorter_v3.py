@@ -1073,7 +1073,7 @@ def render_set_card(set_idx: int, metrics: dict, lefts, rights, lp, rp,
 
 def main():
     # ---- Tabs ----
-    tab_config, tab_results = st.tabs(["Configure", "Results"])
+    tab_config, tab_results = st.tabs(["⚙️ Configure", "📊 Results"])
 
     # ================================================================
     # CONFIGURE TAB
