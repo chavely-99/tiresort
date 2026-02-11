@@ -138,6 +138,10 @@ header[data-testid="stHeader"] { height: 0; min-height: 0; padding: 0; }
 .tire-stat {
     text-align: center;
     line-height: 1.3;
+    padding: 0 2px;
+}
+.tire-stat + .tire-stat {
+    border-left: 1px solid rgba(0,0,0,0.12);
 }
 .tire-stat .label {
     display: block;
