@@ -8,10 +8,8 @@ maxUploadSize = 200
 maxMessageSize = 200
 
 [theme]
-primaryColor = "#FF6B35"  # Trackhouse orange
-backgroundColor = "#0F1419"
-secondaryBackgroundColor = "#1E2329"
-textColor = "#FFFFFF"
+base = "light"
+primaryColor = "#5C6BC0"
 
 [browser]
 # Automatically gather usage stats
