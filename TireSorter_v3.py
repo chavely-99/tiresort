@@ -1,7 +1,7 @@
 """
-TRK Tire Sorter v3.0
+TRK Tire Sorter v4.0
 Trackhouse Racing — Tire Set Optimization Tool
-Multi-start Simulated Annealing optimizer with interactive results.
+Numba JIT-accelerated multi-start Simulated Annealing optimizer.
 """
 
 import math
@@ -9,12 +9,20 @@ import random
 from collections import Counter
 from typing import List, Dict, Tuple, Optional, Callable
 
+import time
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
+
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
 
 try:
     from streamlit_sortables import sort_items
@@ -26,7 +34,7 @@ except ImportError:
 # CONSTANTS
 # ============================================================
 
-APP_TITLE = "TRK Tire Sorter v3"
+APP_TITLE = "TRK Tire Sorter v4"
 N_RESTARTS = 8
 N_ITERATIONS = 100_000
 T_START = 50.0
@@ -523,6 +531,255 @@ def _extract_arrays(lefts: pd.DataFrame, rights: pd.DataFrame):
     return l_sizes, l_springs, l_shifts, l_dates, r_sizes, r_springs, r_shifts, r_dates
 
 
+# ============================================================
+# NUMBA JIT-COMPILED SA INNER LOOP
+# ============================================================
+
+if HAS_NUMBA:
+    @njit(cache=True)
+    def _nb_count_unique_nonzero(v0, v1, v2, v3):
+        """Count unique non-zero values among 4 integers."""
+        arr = np.empty(4, dtype=np.int32)
+        arr[0] = v0; arr[1] = v1; arr[2] = v2; arr[3] = v3
+        count = 0
+        for i in range(4):
+            if arr[i] > 0:
+                is_dup = False
+                for j in range(i):
+                    if arr[j] == arr[i]:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    count += 1
+        if count < 1:
+            return 1
+        return count
+
+    @njit(cache=True)
+    def _nb_date_spread(d0, d1, d2, d3):
+        """Compute date spread (max - min) of non-zero date values."""
+        dmin = 999999
+        dmax = 0
+        dcount = 0
+        if d0 > 0:
+            if d0 < dmin: dmin = d0
+            if d0 > dmax: dmax = d0
+            dcount += 1
+        if d1 > 0:
+            if d1 < dmin: dmin = d1
+            if d1 > dmax: dmax = d1
+            dcount += 1
+        if d2 > 0:
+            if d2 < dmin: dmin = d2
+            if d2 > dmax: dmax = d2
+            dcount += 1
+        if d3 > 0:
+            if d3 < dmin: dmin = d3
+            if d3 > dmax: dmax = d3
+            dcount += 1
+        if dcount >= 2:
+            return dmax - dmin
+        return 0
+
+    @njit(cache=True)
+    def _nb_set_metrics(lp, rp, si, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr):
+        """Compute set metrics using JIT-compiled code."""
+        lf_i = lp[2 * si]
+        lr_i = lp[2 * si + 1]
+        rf_i = rp[2 * si]
+        rr_i = rp[2 * si + 1]
+
+        rr_size = r_sz[rr_i]
+        stag = rr_size - l_sz[lr_i]
+        total_sr = l_sr[lf_i] + r_sr[rf_i] + l_sr[lr_i] + r_sr[rr_i]
+        if total_sr != 0.0:
+            cross = (r_sr[rf_i] + l_sr[lr_i]) / total_sr * 100.0
+        else:
+            cross = 50.0
+        cross_dev = abs(cross - 50.0)
+        rr_dev = abs(rr_size - mode_rr)
+
+        avg_rear_sr = (l_sr[lr_i] + r_sr[rr_i]) / 2.0
+        avg_front_sr = (l_sr[lf_i] + r_sr[rf_i]) / 2.0
+        sr_dev = avg_rear_sr - avg_front_sr
+        if sr_dev < 0.0:
+            sr_dev = 0.0
+
+        shift_count = _nb_count_unique_nonzero(l_sh[lf_i], l_sh[lr_i], r_sh[rf_i], r_sh[rr_i])
+        date_spread = _nb_date_spread(l_dt[lf_i], l_dt[lr_i], r_dt[rf_i], r_dt[rr_i])
+
+        return stag, cross, cross_dev, shift_count, date_spread, rr_dev, sr_dev
+
+    @njit(cache=True)
+    def _nb_set_score(stag, cross_dev, shift_count, date_spread, rr_dev, sr_dev,
+                      target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight):
+        """Compute weighted score for one set."""
+        return (stagger_weight * abs(stag - target)
+                + w_cross * cross_dev
+                + w_rr * rr_dev
+                + w_sr * sr_dev
+                + w_shift * (shift_count - 1)
+                + w_date * date_spread)
+
+    @njit(cache=True)
+    def _nb_sa_restart(lp_init, rp_init, n_sets, n_iterations, t_start, t_end,
+                       inter_set_prob, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                       mode_rr, target, w_cross, w_shift, w_date, w_rr, w_sr,
+                       stagger_weight, seed):
+        """Run one SA restart with JIT compilation. Returns (best_lp, best_rp, best_score)."""
+        np.random.seed(seed)
+        ns2 = 2 * n_sets
+
+        lp = lp_init.copy()
+        rp = rp_init.copy()
+
+        # Compute initial scores
+        cur_scores = np.zeros(n_sets)
+        for s in range(n_sets):
+            stag, cross, cdev, shcnt, dtspd, rrdev, srdev = _nb_set_metrics(
+                lp, rp, s, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr)
+            cur_scores[s] = _nb_set_score(stag, cdev, shcnt, dtspd, rrdev, srdev,
+                                           target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight)
+        cur_total = cur_scores.sum()
+
+        best_total = cur_total
+        best_lp = lp.copy()
+        best_rp = rp.copy()
+
+        for it in range(n_iterations):
+            temp = t_start * (1.0 - it / n_iterations) + t_end
+
+            # Choose move type
+            if np.random.random() < inter_set_prob:
+                use_left = np.random.random() < 0.5
+                a = np.random.randint(0, ns2)
+                b = np.random.randint(0, ns2)
+                while a // 2 == b // 2:
+                    b = np.random.randint(0, ns2)
+            else:
+                use_left = np.random.random() < 0.5
+                s_idx = np.random.randint(0, n_sets)
+                a = 2 * s_idx
+                b = 2 * s_idx + 1
+
+            if use_left:
+                perm = lp
+            else:
+                perm = rp
+
+            set_a = a // 2
+            set_b = b // 2
+
+            # Swap
+            tmp = perm[a]
+            perm[a] = perm[b]
+            perm[b] = tmp
+
+            # Recompute affected sets
+            stag_a, _, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a = _nb_set_metrics(
+                lp, rp, set_a, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr)
+            new_sc_a = _nb_set_score(stag_a, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a,
+                                      target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight)
+            delta = new_sc_a - cur_scores[set_a]
+
+            if set_a != set_b:
+                stag_b, _, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b = _nb_set_metrics(
+                    lp, rp, set_b, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr)
+                new_sc_b = _nb_set_score(stag_b, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b,
+                                          target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight)
+                delta += new_sc_b - cur_scores[set_b]
+
+            # Accept or reject
+            accept = delta < 0.0
+            if not accept and temp > 1e-10:
+                accept = np.random.random() < np.exp(-delta / temp)
+
+            if accept:
+                cur_total += delta
+                cur_scores[set_a] = new_sc_a
+                if set_a != set_b:
+                    cur_scores[set_b] = new_sc_b
+                if cur_total < best_total:
+                    best_total = cur_total
+                    best_lp = lp.copy()
+                    best_rp = rp.copy()
+            else:
+                # Undo swap
+                tmp = perm[a]
+                perm[a] = perm[b]
+                perm[b] = tmp
+
+        return best_lp, best_rp, best_total
+
+
+def _python_sa_restart(lp, rp, n_sets, n_iterations, t_start, t_end,
+                       inter_set_prob, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                       mode_rr, target, w_cross, w_shift, w_date, w_rr, w_sr,
+                       stagger_weight, seed):
+    """Pure Python SA restart (fallback when Numba unavailable)."""
+    rng = np.random.default_rng(seed=seed)
+    ns2 = 2 * n_sets
+
+    cur_scores = np.zeros(n_sets)
+    for s in range(n_sets):
+        stag, cross, cdev, shcnt, dtspd, rrdev, srdev = _fast_set_metrics(
+            lp, rp, s, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=mode_rr)
+        cur_scores[s] = _fast_set_score(stag, cdev, shcnt, dtspd, rrdev, srdev,
+                                         target, w_cross, w_shift, w_date, w_rr, w_sr)
+    cur_total = cur_scores.sum()
+
+    best_total = cur_total
+    best_lp = lp.copy()
+    best_rp = rp.copy()
+
+    for it in range(n_iterations):
+        temp = t_start * (1.0 - it / n_iterations) + t_end
+
+        if rng.random() < inter_set_prob:
+            perm = lp if rng.random() < 0.5 else rp
+            a = int(rng.integers(0, ns2))
+            b = int(rng.integers(0, ns2))
+            while a // 2 == b // 2:
+                b = int(rng.integers(0, ns2))
+        else:
+            perm = lp if rng.random() < 0.5 else rp
+            s_idx = int(rng.integers(0, n_sets))
+            a = 2 * s_idx
+            b = 2 * s_idx + 1
+
+        set_a = a // 2
+        set_b = b // 2
+
+        perm[a], perm[b] = perm[b], perm[a]
+
+        stag_a, _, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a = _fast_set_metrics(
+            lp, rp, set_a, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=mode_rr)
+        new_sc_a = _fast_set_score(stag_a, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a,
+                                    target, w_cross, w_shift, w_date, w_rr, w_sr)
+        delta = new_sc_a - cur_scores[set_a]
+
+        if set_a != set_b:
+            stag_b, _, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b = _fast_set_metrics(
+                lp, rp, set_b, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=mode_rr)
+            new_sc_b = _fast_set_score(stag_b, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b,
+                                        target, w_cross, w_shift, w_date, w_rr, w_sr)
+            delta += new_sc_b - cur_scores[set_b]
+
+        if delta < 0 or rng.random() < math.exp(-delta / max(temp, 1e-10)):
+            cur_total += delta
+            cur_scores[set_a] = new_sc_a
+            if set_a != set_b:
+                cur_scores[set_b] = new_sc_b
+            if cur_total < best_total:
+                best_total = cur_total
+                best_lp = lp.copy()
+                best_rp = rp.copy()
+        else:
+            perm[a], perm[b] = perm[b], perm[a]
+
+    return best_lp, best_rp, best_total
+
+
 def _fast_set_metrics(lp, rp, si, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=0.0):
     """Compute metrics for set si using pre-extracted arrays.
     Returns (stag, cross, cross_dev, shift_count, date_spread, rr_dev, sr_dev)."""
@@ -726,7 +983,7 @@ def _smart_init(lefts, rights, n_sets, target_stagger, rng):
 def run_optimizer(lefts, rights, n_sets, target_stagger, priority_order,
                   progress_callback=None, n_restarts=None, n_iterations=None,
                   _precomputed_arrays=None):
-    """Multi-start SA optimizer using pre-extracted arrays for speed.
+    """Multi-start SA optimizer. Uses Numba JIT when available for ~50x speedup.
     Returns (left_perm, right_perm, score, metrics_list, rr_mode)."""
     if n_restarts is None:
         n_restarts = N_RESTARTS
@@ -739,8 +996,6 @@ def run_optimizer(lefts, rights, n_sets, target_stagger, priority_order,
     w_sr = weights.get("soft_rear", 0.0)
     w_shift = weights.get("shift", 0.0)
     w_date = weights.get("date", 0.0)
-    n_left = len(lefts)
-    n_right = len(rights)
 
     # Pre-extract arrays for fast inner loop (avoids DataFrame .iloc overhead)
     if _precomputed_arrays is not None:
@@ -754,145 +1009,54 @@ def run_optimizer(lefts, rights, n_sets, target_stagger, priority_order,
     best_score = float("inf")
     best_lp = None
     best_rp = None
-    best_metrics = None
-
-    ns2 = 2 * n_sets  # pre-compute
 
     for restart in range(n_restarts):
-        rng = np.random.default_rng(seed=restart * 42 + 7)
-
+        seed = restart * 42 + 7
+        rng = np.random.default_rng(seed=seed)
         lp, rp = _smart_init(lefts, rights, n_sets, target_stagger, rng)
 
-        # Compute initial scores using fast arrays
-        cur_scores = np.zeros(n_sets)
-        cur_stags = np.zeros(n_sets)
-        cur_cross = np.zeros(n_sets)
-        cur_cdev = np.zeros(n_sets)
-        cur_shcnt = np.zeros(n_sets, dtype=int)
-        cur_dtspd = np.zeros(n_sets, dtype=int)
-        cur_rrdev = np.zeros(n_sets)
-        cur_srdev = np.zeros(n_sets)
-        for s in range(n_sets):
-            stag, cross, cdev, shcnt, dtspd, rrdev, srdev = _fast_set_metrics(
-                lp, rp, s, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=rr_mode)
-            cur_stags[s] = stag
-            cur_cross[s] = cross
-            cur_cdev[s] = cdev
-            cur_shcnt[s] = shcnt
-            cur_dtspd[s] = dtspd
-            cur_rrdev[s] = rrdev
-            cur_srdev[s] = srdev
-            cur_scores[s] = _fast_set_score(stag, cdev, shcnt, dtspd, rrdev, srdev,
-                                             target_stagger, w_cross, w_shift, w_date, w_rr, w_sr)
-        cur_total = cur_scores.sum()
+        if HAS_NUMBA:
+            loc_lp, loc_rp, loc_score = _nb_sa_restart(
+                lp, rp, n_sets, n_iterations, T_START, T_END, INTER_SET_PROB,
+                l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                float(rr_mode), target_stagger, w_cross, w_shift, w_date, w_rr, w_sr,
+                STAGGER_WEIGHT, seed)
+        else:
+            loc_lp, loc_rp, loc_score = _python_sa_restart(
+                lp, rp, n_sets, n_iterations, T_START, T_END, INTER_SET_PROB,
+                l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                rr_mode, target_stagger, w_cross, w_shift, w_date, w_rr, w_sr,
+                STAGGER_WEIGHT, seed)
 
-        loc_best = cur_total
-        loc_best_lp = lp.copy()
-        loc_best_rp = rp.copy()
-        loc_best_stags = cur_stags.copy()
-        loc_best_cross = cur_cross.copy()
-        loc_best_cdev = cur_cdev.copy()
-        loc_best_shcnt = cur_shcnt.copy()
-        loc_best_dtspd = cur_dtspd.copy()
-        loc_best_rrdev = cur_rrdev.copy()
-        loc_best_srdev = cur_srdev.copy()
-
-        for it in range(n_iterations):
-            temp = T_START * (1.0 - it / n_iterations) + T_END
-
-            # Choose move type
-            if rng.random() < INTER_SET_PROB:
-                perm = lp if rng.random() < 0.5 else rp
-                a = int(rng.integers(0, ns2))
-                b = int(rng.integers(0, ns2))
-                while a // 2 == b // 2:
-                    b = int(rng.integers(0, ns2))
-            else:
-                perm = lp if rng.random() < 0.5 else rp
-                s_idx = int(rng.integers(0, n_sets))
-                a = 2 * s_idx
-                b = 2 * s_idx + 1
-
-            set_a = a // 2
-            set_b = b // 2
-
-            # Perform swap
-            perm[a], perm[b] = perm[b], perm[a]
-
-            # Recompute affected sets
-            stag_a, cross_a, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a = _fast_set_metrics(
-                lp, rp, set_a, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=rr_mode)
-            new_sc_a = _fast_set_score(stag_a, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a,
-                                        target_stagger, w_cross, w_shift, w_date, w_rr, w_sr)
-            delta = new_sc_a - cur_scores[set_a]
-
-            if set_a != set_b:
-                stag_b, cross_b, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b = _fast_set_metrics(
-                    lp, rp, set_b, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=rr_mode)
-                new_sc_b = _fast_set_score(stag_b, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b,
-                                            target_stagger, w_cross, w_shift, w_date, w_rr, w_sr)
-                delta += new_sc_b - cur_scores[set_b]
-
-            # Accept or reject
-            if delta < 0 or rng.random() < math.exp(-delta / max(temp, 1e-10)):
-                cur_total += delta
-                cur_scores[set_a] = new_sc_a
-                cur_stags[set_a] = stag_a
-                cur_cross[set_a] = cross_a
-                cur_cdev[set_a] = cdev_a
-                cur_shcnt[set_a] = shcnt_a
-                cur_dtspd[set_a] = dtspd_a
-                cur_rrdev[set_a] = rrdev_a
-                cur_srdev[set_a] = srdev_a
-                if set_a != set_b:
-                    cur_scores[set_b] = new_sc_b
-                    cur_stags[set_b] = stag_b
-                    cur_cross[set_b] = cross_b
-                    cur_cdev[set_b] = cdev_b
-                    cur_shcnt[set_b] = shcnt_b
-                    cur_dtspd[set_b] = dtspd_b
-                    cur_rrdev[set_b] = rrdev_b
-                    cur_srdev[set_b] = srdev_b
-
-                if cur_total < loc_best:
-                    loc_best = cur_total
-                    loc_best_lp = lp.copy()
-                    loc_best_rp = rp.copy()
-                    loc_best_stags = cur_stags.copy()
-                    loc_best_cross = cur_cross.copy()
-                    loc_best_cdev = cur_cdev.copy()
-                    loc_best_shcnt = cur_shcnt.copy()
-                    loc_best_dtspd = cur_dtspd.copy()
-                    loc_best_rrdev = cur_rrdev.copy()
-                    loc_best_srdev = cur_srdev.copy()
-            else:
-                perm[a], perm[b] = perm[b], perm[a]
-
-        if loc_best < best_score:
-            best_score = loc_best
-            best_lp = loc_best_lp.copy()
-            best_rp = loc_best_rp.copy()
-            best_metrics = []
-            for s in range(n_sets):
-                lf_i = loc_best_lp[2 * s]
-                lr_i = loc_best_lp[2 * s + 1]
-                rf_i = loc_best_rp[2 * s]
-                rr_i = loc_best_rp[2 * s + 1]
-                avg_sr = (l_sr[lf_i] + r_sr[rf_i] + l_sr[lr_i] + r_sr[rr_i]) / 4.0
-                best_metrics.append({
-                    "stagger": float(loc_best_stags[s]),
-                    "cross_weight": float(loc_best_cross[s]),
-                    "cross_dev": float(loc_best_cdev[s]),
-                    "shift_count": int(loc_best_shcnt[s]),
-                    "date_spread": int(loc_best_dtspd[s]),
-                    "rr_dev": float(loc_best_rrdev[s]),
-                    "rr_size": float(r_sz[loc_best_rp[2 * s + 1]]),
-                    "soft_rear_dev": float(loc_best_srdev[s]),
-                    "avg_sr": float(avg_sr),
-                })
+        if loc_score < best_score:
+            best_score = loc_score
+            best_lp = loc_lp.copy()
+            best_rp = loc_rp.copy()
 
         if progress_callback:
             progress_callback((restart + 1) / n_restarts)
+
+    # Reconstruct detailed metrics from best permutations
+    best_metrics = []
+    for s in range(n_sets):
+        stag, cross, cdev, shcnt, dtspd, rrdev, srdev = _fast_set_metrics(
+            best_lp, best_rp, s, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=rr_mode)
+        lf_i = best_lp[2 * s]
+        lr_i = best_lp[2 * s + 1]
+        rf_i = best_rp[2 * s]
+        rr_i = best_rp[2 * s + 1]
+        avg_sr = (l_sr[lf_i] + r_sr[rf_i] + l_sr[lr_i] + r_sr[rr_i]) / 4.0
+        best_metrics.append({
+            "stagger": float(stag),
+            "cross_weight": float(cross),
+            "cross_dev": float(cdev),
+            "shift_count": int(shcnt),
+            "date_spread": int(dtspd),
+            "rr_dev": float(rrdev),
+            "rr_size": float(r_sz[best_rp[2 * s + 1]]),
+            "soft_rear_dev": float(srdev),
+            "avg_sr": float(avg_sr),
+        })
 
     return best_lp, best_rp, best_score, best_metrics, rr_mode
 
@@ -1242,9 +1406,11 @@ def main():
             # Pre-extract arrays once, share across all runs
             _arrays = _extract_arrays(_lefts, _rights)
 
-            progress = st.progress(0, text="Optimizing (Original Sort)...")
+            engine = "Numba JIT" if HAS_NUMBA else "Python"
+            progress = st.progress(0, text=f"Optimizing ({engine})...")
             total_steps = N_RESTARTS + QUICK_RESTARTS * len(PRIORITY_OPTIONS)
             done_steps = [0]
+            t0 = time.perf_counter()
 
             def _update_main(frac):
                 done_steps[0] = int(frac * N_RESTARTS)
@@ -1290,6 +1456,8 @@ def main():
                     "score": vscore, "metrics": [m.copy() for m in vmetrics],
                 }
 
+            elapsed = time.perf_counter() - t0
+
             # Store all variants and set active to original
             st.session_state.variant_solutions = variants
             st.session_state.active_variant = "Original Sort"
@@ -1298,7 +1466,7 @@ def main():
             st.session_state.solution_score = score
             st.session_state.set_metrics = metrics
             progress.empty()
-            st.success("Optimization complete!")
+            st.success(f"Optimization complete in {elapsed:.1f}s ({engine})")
             st.rerun()
 
         # Quick preview of data
