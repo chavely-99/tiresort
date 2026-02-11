@@ -45,6 +45,8 @@ PRIORITY_KEYS = {
     "Shift Match": "shift",
     "Date Match": "date",
 }
+# Short labels for variant buttons (keeps buttons single-line)
+_BTN_LABELS = {"Common RR Rollout": "RR"}
 
 # ============================================================
 # PAGE CONFIG
@@ -1263,7 +1265,7 @@ def main():
             # 2) Quick variants — each priority promoted to #1 secondary
             base_done = N_RESTARTS
             for vi, pname in enumerate(PRIORITY_OPTIONS):
-                var_label = f"Optimal {pname}"
+                var_label = f"Optimal {_BTN_LABELS.get(pname, pname)}"
                 var_prio = [pname] + [p for p in PRIORITY_OPTIONS if p != pname]
 
                 def _update_var(frac, _vi=vi, _label=var_label):
