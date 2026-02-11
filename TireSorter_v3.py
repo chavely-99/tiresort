@@ -66,36 +66,36 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* Tighten up default Streamlit padding */
-.block-container { padding-top: 1.75rem; padding-bottom: 0.75rem; }
+.block-container { padding-top: 1.25rem; padding-bottom: 0.5rem; }
 section[data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
-header[data-testid="stHeader"] { height: 1.5rem; }
+header[data-testid="stHeader"] { height: 1rem; }
 .stTabs [data-baseweb="tab-list"] { gap: 2px; margin-bottom: 0.25rem; }
 
 /* Set card */
 .set-card {
     border: 2px solid #bbb;
     border-radius: 8px;
-    padding: 10px;
-    margin-bottom: 8px;
+    padding: 8px;
+    margin-bottom: 6px;
     background: #fafafa;
     box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
 .set-header {
     text-align: center;
     font-weight: 800;
-    font-size: 16px;
+    font-size: 15px;
     color: #222;
-    margin-bottom: 4px;
+    margin-bottom: 3px;
 }
 
 /* Metrics bar within each set card */
 .metrics-bar {
     display: flex;
     justify-content: space-around;
-    padding: 4px 6px;
-    margin-bottom: 6px;
+    padding: 3px 6px;
+    margin-bottom: 4px;
     border-radius: 4px;
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
 }
 .metrics-bar.good { background: #c8e6c9; border: 1px solid #66bb6a; }
@@ -107,14 +107,14 @@ header[data-testid="stHeader"] { height: 1.5rem; }
 .car-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 5px;
+    gap: 4px;
 }
 
 /* Individual tire cell */
 .tire-cell {
     border-radius: 4px;
-    padding: 6px 8px;
-    line-height: 1.3;
+    padding: 5px 7px;
+    line-height: 1.25;
 }
 .tire-cell.left-side {
     background: #f0e6ff;
@@ -125,10 +125,10 @@ header[data-testid="stHeader"] { height: 1.5rem; }
     border-left: 4px solid #2563eb;
 }
 .tire-num {
-    font-weight: 800; font-size: 22px; color: #1e293b;
-    margin-bottom: 3px;
+    font-weight: 800; font-size: 20px; color: #1e293b;
+    margin-bottom: 2px;
     border-bottom: 1px solid rgba(0,0,0,0.08);
-    padding-bottom: 2px;
+    padding-bottom: 1px;
 }
 .tire-stats {
     display: grid;
