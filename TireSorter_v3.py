@@ -54,7 +54,7 @@ _BTN_LABELS = {"Common RR Rollout": "RR", "Cross Weight": "Cross %"}
 
 st.set_page_config(
     page_title=APP_TITLE,
-    page_icon="\U0001F3CE",
+    page_icon="🛞",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
