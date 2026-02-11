@@ -66,9 +66,9 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* Tighten up default Streamlit padding */
-.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }
+.block-container { padding-top: 1.75rem; padding-bottom: 0.75rem; }
 section[data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
-header[data-testid="stHeader"] { height: 0; }
+header[data-testid="stHeader"] { height: 1.5rem; }
 .stTabs [data-baseweb="tab-list"] { gap: 2px; margin-bottom: 0.25rem; }
 
 /* Set card */
