@@ -46,7 +46,7 @@ PRIORITY_KEYS = {
     "Date Match": "date",
 }
 # Short labels for variant buttons (keeps buttons single-line)
-_BTN_LABELS = {"Common RR Rollout": "RR"}
+_BTN_LABELS = {"Common RR Rollout": "RR", "Cross Weight": "Cross %"}
 
 # ============================================================
 # PAGE CONFIG
