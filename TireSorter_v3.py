@@ -1156,21 +1156,57 @@ def solve_road_course(lefts: pd.DataFrame, rights: pd.DataFrame, n_sets: int,
     w_date  = weights.get("date", 0.0)
     w_sr    = weights.get("soft_rear", 0.0)
 
-    # --- Build all valid 4-tire candidates ---
-    # rf_i, lr_i from lefts (A-pool); lf_i, rr_i from rights (non-A)
+    # Pre-extract tire properties as numpy arrays (avoids repeated pandas .iloc)
+    _a_sz = lefts["Size"].values.astype(np.float64)
+    _a_sr = lefts["Spring Rate"].values.astype(np.float64)
+    _a_sh = lefts["Shift"].fillna("").values
+    _a_dt = np.array([_date_numeric(d) for d in lefts["Date_Raw"]], dtype=np.int32)
+    _n_sz = rights["Size"].values.astype(np.float64)
+    _n_sr = rights["Spring Rate"].values.astype(np.float64)
+    _n_sh = rights["Shift"].fillna("").values
+    _n_dt = np.array([_date_numeric(d) for d in rights["Date_Raw"]], dtype=np.int32)
+
+    # --- Build candidates: vectorised stagger filter then fast inline metrics ---
+    # Compute stagger for ALL A-perm × N-perm pairs as a numpy matrix (microseconds),
+    # then only compute full metrics for the top-K candidates by |stagger|.
+    _a_perms = np.array(list(itertools.permutations(range(n_a), 2)), dtype=np.int32)
+    _n_perms = np.array(list(itertools.permutations(range(n_n), 2)), dtype=np.int32)
+    # stagger = rights[rr_i].Size − lefts[lr_i].Size  (index-1 of each perm)
+    _stag_mat = _n_sz[_n_perms[:, 1]][None, :] - _a_sz[_a_perms[:, 1]][:, None]
+    _K = min(max(2500, n_sets * n_a * 4), _stag_mat.size)
+    _flat = np.abs(_stag_mat).ravel()
+    _top_flat = np.argpartition(_flat, _K)[:_K] if _K < len(_flat) else np.arange(len(_flat))
+    _top_ai = _top_flat // len(_n_perms)
+    _top_ni = _top_flat % len(_n_perms)
+
     candidates = []
-    for (rf_i, lr_i) in itertools.permutations(range(n_a), 2):
-        rf = lefts.iloc[rf_i]
-        lr = lefts.iloc[lr_i]
-        for (lf_i, rr_i) in itertools.permutations(range(n_n), 2):
-            lf = rights.iloc[lf_i]
-            rr = rights.iloc[rr_i]
-            m = compute_set_metrics(lf, rf, lr, rr, mode_rr=0.0)
-            candidates.append({
-                'a_idx': (rf_i, lr_i),
-                'n_idx': (lf_i, rr_i),
-                'm':     m,
-            })
+    for _k in range(len(_top_ai)):
+        rf_i = int(_a_perms[_top_ai[_k], 0]); lr_i = int(_a_perms[_top_ai[_k], 1])
+        lf_i = int(_n_perms[_top_ni[_k], 0]); rr_i = int(_n_perms[_top_ni[_k], 1])
+        rr_sz    = _n_sz[rr_i]
+        stagger  = rr_sz - _a_sz[lr_i]
+        total_sr = _a_sr[rf_i] + _a_sr[lr_i] + _n_sr[lf_i] + _n_sr[rr_i]
+        cross_wt = (_a_sr[rf_i] + _a_sr[lr_i]) / total_sr * 100 if total_sr else 50.0
+        shifts   = {_a_sh[rf_i], _a_sh[lr_i], _n_sh[lf_i], _n_sh[rr_i]} - {"", "nan", "0"}
+        sh_cnt   = max(len(shifts), 1)
+        dates    = [d for d in (_a_dt[rf_i], _a_dt[lr_i], _n_dt[lf_i], _n_dt[rr_i]) if d > 0]
+        dt_spd   = int(max(dates) - min(dates)) if len(dates) >= 2 else 0
+        avg_rear = (_a_sr[lr_i] + _n_sr[rr_i]) / 2.0
+        avg_frnt = (_a_sr[rf_i] + _n_sr[lf_i]) / 2.0
+        candidates.append({
+            'a_idx': (rf_i, lr_i), 'n_idx': (lf_i, rr_i),
+            'm': {
+                'stagger':       stagger,
+                'cross_weight':  cross_wt,
+                'cross_dev':     abs(cross_wt - 50.0),
+                'shift_count':   sh_cnt,
+                'date_spread':   dt_spd,
+                'rr_dev':        rr_sz,
+                'rr_size':       rr_sz,
+                'soft_rear_dev': max(0.0, avg_rear - avg_frnt),
+                'avg_sr':        total_sr / 4.0,
+            }
+        })
 
     def _solution_score(sol):
         """Lexicographic score tuple: (stagger, spread, cross_dev, other). Lower is better."""
@@ -1187,7 +1223,7 @@ def solve_road_course(lefts: pd.DataFrame, rights: pd.DataFrame, n_sets: int,
         return (stag_score, cross_spread, cross_dev_total, other_score)
 
     # --- Multi-start greedy set cover ---
-    N_RC_RESTARTS = 120
+    N_RC_RESTARTS = 40
     best_sol   = None
     best_score = (float('inf'),) * 4
 
@@ -1228,12 +1264,32 @@ def solve_road_course(lefts: pd.DataFrame, rights: pd.DataFrame, n_sets: int,
 
     # --- Local search: swap individual tires between sets until no improvement ---
     def _make_cand(a_pair, n_pair):
-        rf_i, lr_i = a_pair
-        lf_i, rr_i = n_pair
-        m = compute_set_metrics(
-            rights.iloc[lf_i], lefts.iloc[rf_i],
-            lefts.iloc[lr_i], rights.iloc[rr_i], mode_rr=0.0)
-        return {'a_idx': tuple(a_pair), 'n_idx': tuple(n_pair), 'm': m}
+        rf_i, lr_i = int(a_pair[0]), int(a_pair[1])
+        lf_i, rr_i = int(n_pair[0]), int(n_pair[1])
+        rr_sz    = _n_sz[rr_i]
+        stagger  = rr_sz - _a_sz[lr_i]
+        total_sr = _a_sr[rf_i] + _a_sr[lr_i] + _n_sr[lf_i] + _n_sr[rr_i]
+        cross_wt = (_a_sr[rf_i] + _a_sr[lr_i]) / total_sr * 100 if total_sr else 50.0
+        shifts   = {_a_sh[rf_i], _a_sh[lr_i], _n_sh[lf_i], _n_sh[rr_i]} - {"", "nan", "0"}
+        sh_cnt   = max(len(shifts), 1)
+        dates    = [d for d in (_a_dt[rf_i], _a_dt[lr_i], _n_dt[lf_i], _n_dt[rr_i]) if d > 0]
+        dt_spd   = int(max(dates) - min(dates)) if len(dates) >= 2 else 0
+        avg_rear = (_a_sr[lr_i] + _n_sr[rr_i]) / 2.0
+        avg_frnt = (_a_sr[rf_i] + _n_sr[lf_i]) / 2.0
+        return {
+            'a_idx': (rf_i, lr_i), 'n_idx': (lf_i, rr_i),
+            'm': {
+                'stagger':       stagger,
+                'cross_weight':  cross_wt,
+                'cross_dev':     abs(cross_wt - 50.0),
+                'shift_count':   sh_cnt,
+                'date_spread':   dt_spd,
+                'rr_dev':        rr_sz,
+                'rr_size':       rr_sz,
+                'soft_rear_dev': max(0.0, avg_rear - avg_frnt),
+                'avg_sr':        total_sr / 4.0,
+            }
+        }
 
     a_asgn = [list(c['a_idx']) for c in best_sol]  # [n_sets][2]
     n_asgn = [list(c['n_idx']) for c in best_sol]  # [n_sets][2]
