@@ -1430,6 +1430,46 @@ def solve_road_course(lefts: pd.DataFrame, rights: pd.DataFrame, n_sets: int,
     if best_lp is None:
         return None, None, float('inf'), [], 0.0
 
+    # --- Cross-spread refinement (stagger-preserving local search) ---
+    # Stagger = RR_size - LR_size, so only RR (rp odd) and LR (lp odd) affect it.
+    # Swapping RF (lp even) or LF (rp even) between sets changes cross weight
+    # without touching stagger at all — free optimisation of spread.
+    _lp = best_lp.copy()
+    _rp = best_rp.copy()
+
+    def _set_cross(s):
+        rf_i = int(_lp[2*s]); lr_i = int(_lp[2*s+1])
+        lf_i = int(_rp[2*s]); rr_i = int(_rp[2*s+1])
+        tot = l_sr[rf_i] + l_sr[lr_i] + r_sr[lf_i] + r_sr[rr_i]
+        return (l_sr[rf_i] + l_sr[lr_i]) / tot * 100.0 if tot else 50.0
+
+    _crosses = [_set_cross(s) for s in range(n_sets)]
+
+    _refined = True
+    while _refined:
+        _refined = False
+        for s1 in range(n_sets):
+            for s2 in range(s1 + 1, n_sets):
+                for _do_rf in (True, False):  # True = swap RF, False = swap LF
+                    if _do_rf:
+                        _lp[2*s1], _lp[2*s2] = _lp[2*s2], _lp[2*s1]
+                    else:
+                        _rp[2*s1], _rp[2*s2] = _rp[2*s2], _rp[2*s1]
+                    _nc = list(_crosses)
+                    _nc[s1] = _set_cross(s1)
+                    _nc[s2] = _set_cross(s2)
+                    if max(_nc) - min(_nc) < max(_crosses) - min(_crosses) - 1e-9:
+                        _crosses = _nc
+                        _refined = True
+                    else:
+                        if _do_rf:
+                            _lp[2*s1], _lp[2*s2] = _lp[2*s2], _lp[2*s1]
+                        else:
+                            _rp[2*s1], _rp[2*s2] = _rp[2*s2], _rp[2*s1]
+
+    best_lp = _lp
+    best_rp = _rp
+
     # Compute final mode_rr from actual RR tire sizes in solution
     mode_rr = float(np.mean([r_sz[best_rp[2 * s + 1]] for s in range(n_sets)]))
 
