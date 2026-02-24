@@ -1358,7 +1358,10 @@ def solve_road_course(lefts: pd.DataFrame, rights: pd.DataFrame, n_sets: int,
     identical in shape to run_optimizer's return value.
     """
     weights = build_weights(priority_order)
-    w_cross = weights.get("cross_weight", 0.0)
+    # Cross weight is always a strong secondary objective for road course
+    # (mirrors old lexicographic level-2 behaviour regardless of priority order).
+    # 5000 >> any user priority weight but << STAGGER_WEIGHT=1e6 for any real stagger.
+    w_cross = 5000.0
     w_rr    = 0.0   # RR rollout not used in road course scoring
     w_sr    = weights.get("soft_rear", 0.0)
     w_shift = weights.get("shift", 0.0)
