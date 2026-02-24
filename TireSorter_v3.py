@@ -742,6 +742,121 @@ if HAS_NUMBA:
 
         return best_lp, best_rp, best_total
 
+    @njit(cache=True, fastmath=True)
+    def _nb_rc_set_metrics(lp, rp, si, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr):
+        """Road-course variant: A-pool (l_*) fills RF+LR, non-A (r_*) fills LF+RR.
+        Only difference from _nb_set_metrics: cross uses l_sr[rf_i] instead of r_sr[rf_i]
+        because both RF and LR come from the A-pool."""
+        rf_i = lp[2 * si]        # A-pool: RF
+        lr_i = lp[2 * si + 1]    # A-pool: LR
+        lf_i = rp[2 * si]        # non-A:  LF
+        rr_i = rp[2 * si + 1]    # non-A:  RR
+
+        rr_size = r_sz[rr_i]
+        stag = rr_size - l_sz[lr_i]
+        total_sr = l_sr[rf_i] + r_sr[lf_i] + l_sr[lr_i] + r_sr[rr_i]
+        if total_sr != 0.0:
+            cross = (l_sr[rf_i] + l_sr[lr_i]) / total_sr * 100.0
+        else:
+            cross = 50.0
+        cross_dev = abs(cross - 50.0)
+        rr_dev = abs(rr_size - mode_rr)
+
+        avg_rear_sr = (l_sr[lr_i] + r_sr[rr_i]) / 2.0
+        avg_front_sr = (l_sr[rf_i] + r_sr[lf_i]) / 2.0
+        sr_dev = avg_rear_sr - avg_front_sr
+        if sr_dev < 0.0:
+            sr_dev = 0.0
+
+        shift_count = _nb_count_unique_nonzero(l_sh[rf_i], l_sh[lr_i], r_sh[lf_i], r_sh[rr_i])
+        date_spread = _nb_date_spread(l_dt[rf_i], l_dt[lr_i], r_dt[lf_i], r_dt[rr_i])
+
+        return stag, cross, cross_dev, shift_count, date_spread, rr_dev, sr_dev
+
+    @njit(cache=True, fastmath=True)
+    def _nb_rc_sa_restart(lp_init, rp_init, n_sets, n_iterations, t_start, t_end,
+                          inter_set_prob, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                          mode_rr, target, w_cross, w_shift, w_date, w_rr, w_sr,
+                          stagger_weight, seed):
+        """Road-course SA restart — identical to _nb_sa_restart but uses _nb_rc_set_metrics."""
+        np.random.seed(seed)
+        ns2 = 2 * n_sets
+
+        lp = lp_init.copy()
+        rp = rp_init.copy()
+
+        cur_scores = np.zeros(n_sets)
+        for s in range(n_sets):
+            stag, cross, cdev, shcnt, dtspd, rrdev, srdev = _nb_rc_set_metrics(
+                lp, rp, s, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr)
+            cur_scores[s] = _nb_set_score(stag, cdev, shcnt, dtspd, rrdev, srdev,
+                                           target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight)
+        cur_total = cur_scores.sum()
+
+        best_total = cur_total
+        best_lp = lp.copy()
+        best_rp = rp.copy()
+
+        for it in range(n_iterations):
+            temp = t_start * (1.0 - it / n_iterations) + t_end
+
+            if np.random.random() < inter_set_prob:
+                use_left = np.random.random() < 0.5
+                a = np.random.randint(0, ns2)
+                b = np.random.randint(0, ns2)
+                while a // 2 == b // 2:
+                    b = np.random.randint(0, ns2)
+            else:
+                use_left = np.random.random() < 0.5
+                s_idx = np.random.randint(0, n_sets)
+                a = 2 * s_idx
+                b = 2 * s_idx + 1
+
+            if use_left:
+                perm = lp
+            else:
+                perm = rp
+
+            set_a = a // 2
+            set_b = b // 2
+
+            tmp = perm[a]
+            perm[a] = perm[b]
+            perm[b] = tmp
+
+            stag_a, _, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a = _nb_rc_set_metrics(
+                lp, rp, set_a, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr)
+            new_sc_a = _nb_set_score(stag_a, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a,
+                                      target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight)
+            delta = new_sc_a - cur_scores[set_a]
+
+            if set_a != set_b:
+                stag_b, _, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b = _nb_rc_set_metrics(
+                    lp, rp, set_b, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr)
+                new_sc_b = _nb_set_score(stag_b, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b,
+                                          target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight)
+                delta += new_sc_b - cur_scores[set_b]
+
+            accept = delta < 0.0
+            if not accept and temp > 1e-10:
+                accept = np.random.random() < np.exp(-delta / temp)
+
+            if accept:
+                cur_total += delta
+                cur_scores[set_a] = new_sc_a
+                if set_a != set_b:
+                    cur_scores[set_b] = new_sc_b
+                if cur_total < best_total:
+                    best_total = cur_total
+                    best_lp = lp.copy()
+                    best_rp = rp.copy()
+            else:
+                tmp = perm[a]
+                perm[a] = perm[b]
+                perm[b] = tmp
+
+        return best_lp, best_rp, best_total
+
 
 def _python_sa_restart(lp, rp, n_sets, n_iterations, t_start, t_end,
                        inter_set_prob, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
@@ -791,6 +906,103 @@ def _python_sa_restart(lp, rp, n_sets, n_iterations, t_start, t_end,
 
         if set_a != set_b:
             stag_b, _, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b = _fast_set_metrics(
+                lp, rp, set_b, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=mode_rr)
+            new_sc_b = _fast_set_score(stag_b, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b,
+                                        target, w_cross, w_shift, w_date, w_rr, w_sr)
+            delta += new_sc_b - cur_scores[set_b]
+
+        if delta < 0 or rng.random() < math.exp(-delta / max(temp, 1e-10)):
+            cur_total += delta
+            cur_scores[set_a] = new_sc_a
+            if set_a != set_b:
+                cur_scores[set_b] = new_sc_b
+            if cur_total < best_total:
+                best_total = cur_total
+                best_lp = lp.copy()
+                best_rp = rp.copy()
+        else:
+            perm[a], perm[b] = perm[b], perm[a]
+
+    return best_lp, best_rp, best_total
+
+
+def _fast_rc_set_metrics(lp, rp, si, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=0.0):
+    """Road-course metrics using pre-extracted arrays: A-pool (l_*) → RF+LR, non-A (r_*) → LF+RR."""
+    rf_i = lp[2 * si]        # A-pool: RF
+    lr_i = lp[2 * si + 1]    # A-pool: LR
+    lf_i = rp[2 * si]        # non-A:  LF
+    rr_i = rp[2 * si + 1]    # non-A:  RR
+
+    rr_size = r_sz[rr_i]
+    stag = rr_size - l_sz[lr_i]
+    total_sr = l_sr[rf_i] + r_sr[lf_i] + l_sr[lr_i] + r_sr[rr_i]
+    cross = (l_sr[rf_i] + l_sr[lr_i]) / total_sr * 100.0 if total_sr else 50.0
+    cross_dev = abs(cross - 50.0)
+    rr_dev = abs(rr_size - mode_rr)
+    avg_rear_sr = (l_sr[lr_i] + r_sr[rr_i]) / 2.0
+    avg_front_sr = (l_sr[rf_i] + r_sr[lf_i]) / 2.0
+    sr_dev = max(0.0, avg_rear_sr - avg_front_sr)
+    shifts = set()
+    for sv in (l_sh[rf_i], l_sh[lr_i], r_sh[lf_i], r_sh[rr_i]):
+        if sv > 0:
+            shifts.add(sv)
+    shift_count = max(len(shifts), 1)
+    dates = []
+    for dv in (l_dt[rf_i], l_dt[lr_i], r_dt[lf_i], r_dt[rr_i]):
+        if dv > 0:
+            dates.append(dv)
+    date_spread = (max(dates) - min(dates)) if len(dates) >= 2 else 0
+    return stag, cross, cross_dev, shift_count, date_spread, rr_dev, sr_dev
+
+
+def _python_rc_sa_restart(lp, rp, n_sets, n_iterations, t_start, t_end,
+                          inter_set_prob, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                          mode_rr, target, w_cross, w_shift, w_date, w_rr, w_sr,
+                          stagger_weight, seed):
+    """Pure Python road-course SA restart (fallback when Numba unavailable)."""
+    rng = np.random.default_rng(seed=seed)
+    ns2 = 2 * n_sets
+
+    cur_scores = np.zeros(n_sets)
+    for s in range(n_sets):
+        stag, cross, cdev, shcnt, dtspd, rrdev, srdev = _fast_rc_set_metrics(
+            lp, rp, s, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=mode_rr)
+        cur_scores[s] = _fast_set_score(stag, cdev, shcnt, dtspd, rrdev, srdev,
+                                         target, w_cross, w_shift, w_date, w_rr, w_sr)
+    cur_total = cur_scores.sum()
+
+    best_total = cur_total
+    best_lp = lp.copy()
+    best_rp = rp.copy()
+
+    for it in range(n_iterations):
+        temp = t_start * (1.0 - it / n_iterations) + t_end
+
+        if rng.random() < inter_set_prob:
+            perm = lp if rng.random() < 0.5 else rp
+            a = int(rng.integers(0, ns2))
+            b = int(rng.integers(0, ns2))
+            while a // 2 == b // 2:
+                b = int(rng.integers(0, ns2))
+        else:
+            perm = lp if rng.random() < 0.5 else rp
+            s_idx = int(rng.integers(0, n_sets))
+            a = 2 * s_idx
+            b = 2 * s_idx + 1
+
+        set_a = a // 2
+        set_b = b // 2
+
+        perm[a], perm[b] = perm[b], perm[a]
+
+        stag_a, _, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a = _fast_rc_set_metrics(
+            lp, rp, set_a, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=mode_rr)
+        new_sc_a = _fast_set_score(stag_a, cdev_a, shcnt_a, dtspd_a, rrdev_a, srdev_a,
+                                    target, w_cross, w_shift, w_date, w_rr, w_sr)
+        delta = new_sc_a - cur_scores[set_a]
+
+        if set_a != set_b:
+            stag_b, _, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b = _fast_rc_set_metrics(
                 lp, rp, set_b, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr=mode_rr)
             new_sc_b = _fast_set_score(stag_b, cdev_b, shcnt_b, dtspd_b, rrdev_b, srdev_b,
                                         target, w_cross, w_shift, w_date, w_rr, w_sr)
@@ -1127,194 +1339,116 @@ def run_optimizer(lefts, rights, n_sets, target_stagger, priority_order,
 
 
 # ============================================================
-# ROAD COURSE EXHAUSTIVE SOLVER
+# ROAD COURSE SA SOLVER
 # ============================================================
 
 def solve_road_course(lefts: pd.DataFrame, rights: pd.DataFrame, n_sets: int,
                       priority_order: list, progress_callback=None):
-    """Road course tire assignment via exhaustive candidates + multi-start greedy.
+    """Road course tire assignment via Numba JIT simulated annealing.
 
     lefts  = A-pool  → fills RF (slot 0) and LR (slot 1) positions
     rights = non-A   → fills LF (slot 0) and RR (slot 1) positions
 
-    Scoring is lexicographic (true hierarchy, not weighted):
-      1. Minimize total |stagger| across all sets
-      2. Minimize cross weight spread (max - min across sets)
-      3. Minimize sum of |cross - 50%|  (tiebreaker toward 50%)
-      4. Minimize user priorities (shift/date/soft-rear) weighted by drag order
-
-    Python tuple comparison is lexicographic, so level 1 always beats level 2
-    regardless of magnitude — no weight tuning needed.
+    Uses the same parallel SA engine as the oval optimizer, with a
+    road-course-specific metrics function (_nb_rc_set_metrics) where
+    cross weight correctly uses both RF and LR from the A-pool.
+    STAGGER_WEIGHT=1e6 ensures stagger always dominates secondary criteria.
 
     Returns (left_perm, right_perm, score, metrics_list, mode_rr)
     identical in shape to run_optimizer's return value.
     """
-    n_a = len(lefts)
-    n_n = len(rights)
     weights = build_weights(priority_order)
+    w_cross = weights.get("cross_weight", 0.0)
+    w_rr    = 0.0   # RR rollout not used in road course scoring
+    w_sr    = weights.get("soft_rear", 0.0)
     w_shift = weights.get("shift", 0.0)
     w_date  = weights.get("date", 0.0)
-    w_sr    = weights.get("soft_rear", 0.0)
 
-    # --- Build all valid 4-tire candidates ---
-    # rf_i, lr_i from lefts (A-pool); lf_i, rr_i from rights (non-A)
-    candidates = []
-    for (rf_i, lr_i) in itertools.permutations(range(n_a), 2):
-        rf = lefts.iloc[rf_i]
-        lr = lefts.iloc[lr_i]
-        for (lf_i, rr_i) in itertools.permutations(range(n_n), 2):
-            lf = rights.iloc[lf_i]
-            rr = rights.iloc[rr_i]
-            m = compute_set_metrics(lf, rf, lr, rr, mode_rr=0.0)
-            candidates.append({
-                'a_idx': (rf_i, lr_i),
-                'n_idx': (lf_i, rr_i),
-                'm':     m,
-            })
+    # Extract arrays (A-pool as "left", non-A as "right")
+    l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt = _extract_arrays(lefts, rights)
 
-    def _solution_score(sol):
-        """Lexicographic score tuple: (stagger, spread, cross_dev, other). Lower is better."""
-        if len(sol) < n_sets:
-            return (float('inf'),) * 4
-        staggers = [c['m']['stagger'] for c in sol]
-        crosses  = [c['m']['cross_weight'] for c in sol]
-        stag_score      = sum(abs(s) for s in staggers)
-        cross_spread    = max(crosses) - min(crosses) if len(crosses) > 1 else 0.0
-        cross_dev_total = sum(abs(c - 50.0) for c in crosses)
-        other_score     = (w_shift * sum(c['m']['shift_count'] - 1 for c in sol)
-                           + w_date * sum(c['m']['date_spread'] for c in sol)
-                           + w_sr   * sum(c['m']['soft_rear_dev'] for c in sol))
-        return (stag_score, cross_spread, cross_dev_total, other_score)
+    if HAS_NUMBA:
+        l_sz = np.ascontiguousarray(l_sz, dtype=np.float64)
+        l_sr = np.ascontiguousarray(l_sr, dtype=np.float64)
+        l_sh = np.ascontiguousarray(l_sh, dtype=np.int32)
+        l_dt = np.ascontiguousarray(l_dt, dtype=np.int32)
+        r_sz = np.ascontiguousarray(r_sz, dtype=np.float64)
+        r_sr = np.ascontiguousarray(r_sr, dtype=np.float64)
+        r_sh = np.ascontiguousarray(r_sh, dtype=np.int32)
+        r_dt = np.ascontiguousarray(r_dt, dtype=np.int32)
 
-    # --- Multi-start greedy set cover ---
-    N_RC_RESTARTS = 120
-    best_sol   = None
-    best_score = (float('inf'),) * 4
+    # Mode RR from non-A pool (most common RR tire size in the pool)
+    rr_mode = Counter(r_sz).most_common(1)[0][0]
 
-    # Restart 0: sort by per-set stagger deviation first (deterministic best-first)
-    sorted_cands = sorted(candidates, key=lambda c: abs(c['m']['stagger']))
+    # Generate initial solutions with target_stagger=0.
+    # _smart_init greedily pairs LR/RR tires to minimise |RR-LR| = |stagger|.
+    inits = []
+    for restart in range(N_RESTARTS):
+        seed = restart * 42 + 13   # distinct seed series from oval (oval uses +7)
+        rng = np.random.default_rng(seed=seed)
+        lp, rp = _smart_init(lefts, rights, n_sets, 0.0, rng)
+        inits.append((lp, rp, seed))
 
-    for restart in range(N_RC_RESTARTS):
-        if restart == 0:
-            pool = sorted_cands
-        else:
-            rng  = np.random.default_rng(restart)
-            pool = [candidates[i] for i in rng.permutation(len(candidates))]
+    def _run_one_rc(lp, rp, seed):
+        if HAS_NUMBA:
+            try:
+                return _nb_rc_sa_restart(
+                    lp, rp, n_sets, N_ITERATIONS, T_START, T_END, INTER_SET_PROB,
+                    l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                    float(rr_mode), 0.0, w_cross, w_shift, w_date, w_rr, w_sr,
+                    STAGGER_WEIGHT, seed)
+            except TypeError:
+                pass
+        return _python_rc_sa_restart(
+            lp, rp, n_sets, N_ITERATIONS, T_START, T_END, INTER_SET_PROB,
+            l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+            rr_mode, 0.0, w_cross, w_shift, w_date, w_rr, w_sr,
+            STAGGER_WEIGHT, seed)
 
-        used_a = set()
-        used_n = set()
-        sol    = []
-        for cand in pool:
-            rf_i, lr_i = cand['a_idx']
-            lf_i, rr_i = cand['n_idx']
-            if (rf_i not in used_a and lr_i not in used_a
-                    and lf_i not in used_n and rr_i not in used_n):
-                sol.append(cand)
-                used_a.update((rf_i, lr_i))
-                used_n.update((lf_i, rr_i))
-                if len(sol) == n_sets:
-                    break
+    n_workers = min(N_RESTARTS, os.cpu_count() or 4)
+    best_sa_score = float("inf")
+    best_lp = None
+    best_rp = None
 
-        sc = _solution_score(sol)
-        if sc < best_score:
-            best_score = sc
-            best_sol   = sol
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_run_one_rc, lp, rp, seed): i
+                   for i, (lp, rp, seed) in enumerate(inits)}
+        done = 0
+        for fut in as_completed(futures):
+            loc_lp, loc_rp, loc_score = fut.result()
+            if loc_score < best_sa_score:
+                best_sa_score = loc_score
+                best_lp = loc_lp.copy()
+                best_rp = loc_rp.copy()
+            done += 1
+            if progress_callback:
+                progress_callback(done / N_RESTARTS)
 
-        if progress_callback:
-            progress_callback((restart + 1) / N_RC_RESTARTS)
-
-    if not best_sol:
+    if best_lp is None:
         return None, None, float('inf'), [], 0.0
 
-    # --- Local search: swap individual tires between sets until no improvement ---
-    def _make_cand(a_pair, n_pair):
-        rf_i, lr_i = a_pair
-        lf_i, rr_i = n_pair
-        m = compute_set_metrics(
-            rights.iloc[lf_i], lefts.iloc[rf_i],
-            lefts.iloc[lr_i], rights.iloc[rr_i], mode_rr=0.0)
-        return {'a_idx': tuple(a_pair), 'n_idx': tuple(n_pair), 'm': m}
+    # Compute final mode_rr from actual RR tire sizes in solution
+    mode_rr = float(np.mean([r_sz[best_rp[2 * s + 1]] for s in range(n_sets)]))
 
-    a_asgn = [list(c['a_idx']) for c in best_sol]  # [n_sets][2]
-    n_asgn = [list(c['n_idx']) for c in best_sol]  # [n_sets][2]
-    positions = [(s, p) for s in range(n_sets) for p in range(2)]
-
-    # Build once; update incrementally — only recompute the 1-2 changed sets per swap
-    curr_sol = [_make_cand(a_asgn[s], n_asgn[s]) for s in range(n_sets)]
-    curr_score = best_score
-
-    ls_improved = True
-    while ls_improved:
-        ls_improved = False
-        # A-pool swaps
-        for (s1, p1), (s2, p2) in itertools.combinations(positions, 2):
-            a_asgn[s1][p1], a_asgn[s2][p2] = a_asgn[s2][p2], a_asgn[s1][p1]
-            new1 = _make_cand(a_asgn[s1], n_asgn[s1])
-            tentative = list(curr_sol)
-            tentative[s1] = new1
-            if s1 != s2:
-                tentative[s2] = _make_cand(a_asgn[s2], n_asgn[s2])
-            sc = _solution_score(tentative)
-            if sc < curr_score:
-                curr_sol = tentative
-                curr_score = sc
-                ls_improved = True
-            else:
-                a_asgn[s1][p1], a_asgn[s2][p2] = a_asgn[s2][p2], a_asgn[s1][p1]
-        # Non-A pool swaps
-        for (s1, p1), (s2, p2) in itertools.combinations(positions, 2):
-            n_asgn[s1][p1], n_asgn[s2][p2] = n_asgn[s2][p2], n_asgn[s1][p1]
-            new1 = _make_cand(a_asgn[s1], n_asgn[s1])
-            tentative = list(curr_sol)
-            tentative[s1] = new1
-            if s1 != s2:
-                tentative[s2] = _make_cand(a_asgn[s2], n_asgn[s2])
-            sc = _solution_score(tentative)
-            if sc < curr_score:
-                curr_sol = tentative
-                curr_score = sc
-                ls_improved = True
-            else:
-                n_asgn[s1][p1], n_asgn[s2][p2] = n_asgn[s2][p2], n_asgn[s1][p1]
-
-    best_sol = curr_sol
-
-    # --- Build perm arrays ---
-    left_perm  = np.zeros(n_a, dtype=np.int64)
-    right_perm = np.zeros(n_n, dtype=np.int64)
-
-    used_a_set = set()
-    used_n_set = set()
-    for s, cand in enumerate(best_sol):
-        rf_i, lr_i = cand['a_idx']
-        lf_i, rr_i = cand['n_idx']
-        left_perm[2 * s]     = rf_i
-        left_perm[2 * s + 1] = lr_i
-        right_perm[2 * s]    = lf_i
-        right_perm[2 * s + 1] = rr_i
-        used_a_set.update((rf_i, lr_i))
-        used_n_set.update((lf_i, rr_i))
-
-    # Fill leftover (unused) tire slots beyond 2*n_sets
-    spare_a = [i for i in range(n_a) if i not in used_a_set]
-    spare_n = [i for i in range(n_n) if i not in used_n_set]
-    for k, idx in enumerate(spare_a):
-        pos = 2 * n_sets + k
-        if pos < n_a:
-            left_perm[pos] = idx
-    for k, idx in enumerate(spare_n):
-        pos = 2 * n_sets + k
-        if pos < n_n:
-            right_perm[pos] = idx
-
-    # --- Compute final metrics ---
-    mode_rr = float(np.mean([rights.iloc[c['n_idx'][1]]["Size"] for c in best_sol]))
+    # Reconstruct detailed metrics using the road-course-aware helper
     metrics = [
-        _compute_from_perms(left_perm, right_perm, lefts, rights, s, mode_rr=mode_rr, road_course=True)
+        _compute_from_perms(best_lp, best_rp, lefts, rights, s,
+                            mode_rr=mode_rr, road_course=True)
         for s in range(n_sets)
     ]
 
-    return left_perm, right_perm, best_score, metrics, mode_rr
+    # Return lexicographic score tuple for display compatibility
+    staggers = [m['stagger'] for m in metrics]
+    crosses  = [m['cross_weight'] for m in metrics]
+    stag_score      = sum(abs(s) for s in staggers)
+    cross_spread    = max(crosses) - min(crosses) if len(crosses) > 1 else 0.0
+    cross_dev_total = sum(abs(c - 50.0) for c in crosses)
+    other_score     = (w_shift * sum(m['shift_count'] - 1 for m in metrics)
+                       + w_date * sum(m['date_spread'] for m in metrics)
+                       + w_sr   * sum(m['soft_rear_dev'] for m in metrics))
+    best_score = (stag_score, cross_spread, cross_dev_total, other_score)
+
+    return best_lp, best_rp, best_score, metrics, mode_rr
 
 
 # ============================================================
