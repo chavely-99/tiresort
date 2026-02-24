@@ -1,12 +1,15 @@
 """
-TRK Tire Sorter v4.0
+TRK Tire Sorter v5.0
 Trackhouse Racing — Tire Set Optimization Tool
 Numba JIT-accelerated multi-start Simulated Annealing optimizer.
 """
 
 import math
+import os
 import random
+import itertools
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Optional, Callable
 
 import time
@@ -34,7 +37,7 @@ except ImportError:
 # CONSTANTS
 # ============================================================
 
-APP_TITLE = "TRK Tire Sorter v4"
+APP_TITLE = "TRK Tire Sorter v5"
 N_RESTARTS = 8
 N_ITERATIONS = 100_000
 T_START = 50.0
@@ -246,6 +249,8 @@ _SS_DEFAULTS = {
     "_upload_token": None,
     "variant_solutions": {},   # {"Original Sort": {...}, "Optimal Cross": {...}, ...}
     "active_variant": "Original Sort",
+    "track_type": "Oval",      # "Oval" or "Road Course"
+    "_last_track_type": "Oval",
 }
 
 for _k, _v in _SS_DEFAULTS.items():
@@ -304,6 +309,8 @@ def load_scan_data(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[str]
             col_map["date"] = c
         elif cl == "size" and "size" not in col_map:
             col_map["size"] = c
+        elif cl == "wheel" and "wheel" not in col_map:
+            col_map["wheel"] = c
 
     # Tire ID: second 'Number' column → pandas names it 'Number.1'
     if "Number.1" in df.columns:
@@ -335,6 +342,11 @@ def load_scan_data(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[str]
     else:
         tires["Date_Raw"] = 0
         tires["Date"] = ""
+
+    if "wheel" in col_map:
+        tires["Wheel"] = df[col_map["wheel"]].astype(str).str.strip()
+    else:
+        tires["Wheel"] = ""
 
     # Drop rows missing critical data
     before = len(tires)
@@ -393,6 +405,25 @@ def _max_matching(adj: Dict[int, List[int]]) -> int:
     for u in adj:
         _augment(u, set())
     return len(match_right)
+
+
+def split_pools(tires: pd.DataFrame, track_type: str, ls_dcode: str = None):
+    """Split tires into (lefts, rights) based on track type.
+
+    Oval   : lefts = ls_dcode, rights = everything else.
+    Road Course: lefts = A-pool (Wheel ends with 'A' → LR/RF),
+                 rights = non-A pool (LF/RR).
+    Returns (lefts, rights).
+    """
+    if track_type == "Road Course":
+        wheel_upper = tires["Wheel"].str.upper()
+        a_pool = tires[wheel_upper.str.endswith("A")].reset_index(drop=True)
+        non_a_pool = tires[~wheel_upper.str.endswith("A")].reset_index(drop=True)
+        return a_pool, non_a_pool
+    else:
+        lefts = tires[tires["D-Code"] == str(ls_dcode)].reset_index(drop=True)
+        rights = tires[tires["D-Code"] != str(ls_dcode)].reset_index(drop=True)
+        return lefts, rights
 
 
 def analyze_stagger(lefts: pd.DataFrame, rights: pd.DataFrame) -> dict:
@@ -532,11 +563,11 @@ def _extract_arrays(lefts: pd.DataFrame, rights: pd.DataFrame):
 
 
 # ============================================================
-# NUMBA JIT-COMPILED SA INNER LOOP
+# NUMBA JIT-COMPILED SA INNER LOOP (cache cleared 2026-02-23)
 # ============================================================
 
 if HAS_NUMBA:
-    @njit(cache=True)
+    @njit(cache=True, fastmath=True)
     def _nb_count_unique_nonzero(v0, v1, v2, v3):
         """Count unique non-zero values among 4 integers."""
         arr = np.empty(4, dtype=np.int32)
@@ -555,7 +586,7 @@ if HAS_NUMBA:
             return 1
         return count
 
-    @njit(cache=True)
+    @njit(cache=True, fastmath=True)
     def _nb_date_spread(d0, d1, d2, d3):
         """Compute date spread (max - min) of non-zero date values."""
         dmin = 999999
@@ -581,7 +612,7 @@ if HAS_NUMBA:
             return dmax - dmin
         return 0
 
-    @njit(cache=True)
+    @njit(cache=True, fastmath=True)
     def _nb_set_metrics(lp, rp, si, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt, mode_rr):
         """Compute set metrics using JIT-compiled code."""
         lf_i = lp[2 * si]
@@ -610,7 +641,7 @@ if HAS_NUMBA:
 
         return stag, cross, cross_dev, shift_count, date_spread, rr_dev, sr_dev
 
-    @njit(cache=True)
+    @njit(cache=True, fastmath=True)
     def _nb_set_score(stag, cross_dev, shift_count, date_spread, rr_dev, sr_dev,
                       target, w_cross, w_shift, w_date, w_rr, w_sr, stagger_weight):
         """Compute weighted score for one set."""
@@ -621,7 +652,7 @@ if HAS_NUMBA:
                 + w_shift * (shift_count - 1)
                 + w_date * date_spread)
 
-    @njit(cache=True)
+    @njit(cache=True, fastmath=True)
     def _nb_sa_restart(lp_init, rp_init, n_sets, n_iterations, t_start, t_end,
                        inter_set_prob, l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
                        mode_rr, target, w_cross, w_shift, w_date, w_rr, w_sr,
@@ -877,12 +908,20 @@ def _set_score(metrics: dict, target_stagger: float, weights: dict) -> float:
     return s
 
 
-def _compute_from_perms(left_perm, right_perm, lefts, rights, set_idx, mode_rr=0.0):
+def _compute_from_perms(left_perm, right_perm, lefts, rights, set_idx, mode_rr=0.0, road_course=False):
     """Compute set metrics for set_idx from permutation arrays."""
-    lf = lefts.iloc[left_perm[2 * set_idx]]
-    lr = lefts.iloc[left_perm[2 * set_idx + 1]]
-    rf = rights.iloc[right_perm[2 * set_idx]]
-    rr = rights.iloc[right_perm[2 * set_idx + 1]]
+    if road_course:
+        # RC: left_perm slot0=rf_i (A→RF), slot1=lr_i (A→LR)
+        #     right_perm slot0=lf_i (non-A→LF), slot1=rr_i (non-A→RR)
+        rf = lefts.iloc[left_perm[2 * set_idx]]
+        lr = lefts.iloc[left_perm[2 * set_idx + 1]]
+        lf = rights.iloc[right_perm[2 * set_idx]]
+        rr = rights.iloc[right_perm[2 * set_idx + 1]]
+    else:
+        lf = lefts.iloc[left_perm[2 * set_idx]]
+        lr = lefts.iloc[left_perm[2 * set_idx + 1]]
+        rf = rights.iloc[right_perm[2 * set_idx]]
+        rr = rights.iloc[right_perm[2 * set_idx + 1]]
     return compute_set_metrics(lf, rf, lr, rr, mode_rr=mode_rr)
 
 
@@ -958,8 +997,8 @@ def _smart_init(lefts, rights, n_sets, target_stagger, rng):
 
     # Build permutation arrays:
     # Set i: left_perm[2i]=LF, left_perm[2i+1]=LR, right_perm[2i]=RF, right_perm[2i+1]=RR
-    left_perm = np.zeros(n_left, dtype=int)
-    right_perm = np.zeros(n_right, dtype=int)
+    left_perm = np.zeros(n_left, dtype=np.int32)
+    right_perm = np.zeros(n_right, dtype=np.int32)
 
     for k in range(n_sets):
         left_perm[2 * k] = remaining_left[k] if k < len(remaining_left) else lr_indices[k]
@@ -1003,38 +1042,64 @@ def run_optimizer(lefts, rights, n_sets, target_stagger, priority_order,
     else:
         l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt = _extract_arrays(lefts, rights)
 
+    # Enforce dtypes for Numba — pandas can produce object/nullable arrays
+    # depending on how the DataFrame was constructed (e.g. after concat/reset_index)
+    if HAS_NUMBA:
+        l_sz = np.ascontiguousarray(l_sz, dtype=np.float64)
+        l_sr = np.ascontiguousarray(l_sr, dtype=np.float64)
+        l_sh = np.ascontiguousarray(l_sh, dtype=np.int32)
+        l_dt = np.ascontiguousarray(l_dt, dtype=np.int32)
+        r_sz = np.ascontiguousarray(r_sz, dtype=np.float64)
+        r_sr = np.ascontiguousarray(r_sr, dtype=np.float64)
+        r_sh = np.ascontiguousarray(r_sh, dtype=np.int32)
+        r_dt = np.ascontiguousarray(r_dt, dtype=np.int32)
+
     # Mode RR rollout: most common right-side size in the pool
     rr_mode = Counter(r_sz).most_common(1)[0][0]
 
-    best_score = float("inf")
-    best_lp = None
-    best_rp = None
-
+    # Generate all initial solutions up front (sequential — touches DataFrames)
+    inits = []
     for restart in range(n_restarts):
         seed = restart * 42 + 7
         rng = np.random.default_rng(seed=seed)
         lp, rp = _smart_init(lefts, rights, n_sets, target_stagger, rng)
+        inits.append((lp, rp, seed))
 
+    def _run_one(lp, rp, seed):
+        """Run one SA restart. Numba releases GIL → true thread parallelism."""
         if HAS_NUMBA:
-            loc_lp, loc_rp, loc_score = _nb_sa_restart(
-                lp, rp, n_sets, n_iterations, T_START, T_END, INTER_SET_PROB,
-                l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
-                float(rr_mode), target_stagger, w_cross, w_shift, w_date, w_rr, w_sr,
-                STAGGER_WEIGHT, seed)
-        else:
-            loc_lp, loc_rp, loc_score = _python_sa_restart(
-                lp, rp, n_sets, n_iterations, T_START, T_END, INTER_SET_PROB,
-                l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
-                rr_mode, target_stagger, w_cross, w_shift, w_date, w_rr, w_sr,
-                STAGGER_WEIGHT, seed)
+            try:
+                return _nb_sa_restart(
+                    lp, rp, n_sets, n_iterations, T_START, T_END, INTER_SET_PROB,
+                    l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+                    float(rr_mode), target_stagger, w_cross, w_shift, w_date, w_rr, w_sr,
+                    STAGGER_WEIGHT, seed)
+            except TypeError:
+                pass
+        return _python_sa_restart(
+            lp, rp, n_sets, n_iterations, T_START, T_END, INTER_SET_PROB,
+            l_sz, l_sr, l_sh, l_dt, r_sz, r_sr, r_sh, r_dt,
+            rr_mode, target_stagger, w_cross, w_shift, w_date, w_rr, w_sr,
+            STAGGER_WEIGHT, seed)
 
-        if loc_score < best_score:
-            best_score = loc_score
-            best_lp = loc_lp.copy()
-            best_rp = loc_rp.copy()
+    n_workers = min(n_restarts, os.cpu_count() or 4)
+    best_score = float("inf")
+    best_lp = None
+    best_rp = None
 
-        if progress_callback:
-            progress_callback((restart + 1) / n_restarts)
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_run_one, lp, rp, seed): i
+                   for i, (lp, rp, seed) in enumerate(inits)}
+        done = 0
+        for fut in as_completed(futures):
+            loc_lp, loc_rp, loc_score = fut.result()
+            if loc_score < best_score:
+                best_score = loc_score
+                best_lp = loc_lp.copy()
+                best_rp = loc_rp.copy()
+            done += 1
+            if progress_callback:
+                progress_callback(done / n_restarts)
 
     # Reconstruct detailed metrics from best permutations
     best_metrics = []
@@ -1062,6 +1127,197 @@ def run_optimizer(lefts, rights, n_sets, target_stagger, priority_order,
 
 
 # ============================================================
+# ROAD COURSE EXHAUSTIVE SOLVER
+# ============================================================
+
+def solve_road_course(lefts: pd.DataFrame, rights: pd.DataFrame, n_sets: int,
+                      priority_order: list, progress_callback=None):
+    """Road course tire assignment via exhaustive candidates + multi-start greedy.
+
+    lefts  = A-pool  → fills RF (slot 0) and LR (slot 1) positions
+    rights = non-A   → fills LF (slot 0) and RR (slot 1) positions
+
+    Scoring is lexicographic (true hierarchy, not weighted):
+      1. Minimize total |stagger| across all sets
+      2. Minimize cross weight spread (max - min across sets)
+      3. Minimize sum of |cross - 50%|  (tiebreaker toward 50%)
+      4. Minimize user priorities (shift/date/soft-rear) weighted by drag order
+
+    Python tuple comparison is lexicographic, so level 1 always beats level 2
+    regardless of magnitude — no weight tuning needed.
+
+    Returns (left_perm, right_perm, score, metrics_list, mode_rr)
+    identical in shape to run_optimizer's return value.
+    """
+    n_a = len(lefts)
+    n_n = len(rights)
+    weights = build_weights(priority_order)
+    w_shift = weights.get("shift", 0.0)
+    w_date  = weights.get("date", 0.0)
+    w_sr    = weights.get("soft_rear", 0.0)
+
+    # --- Build all valid 4-tire candidates ---
+    # rf_i, lr_i from lefts (A-pool); lf_i, rr_i from rights (non-A)
+    candidates = []
+    for (rf_i, lr_i) in itertools.permutations(range(n_a), 2):
+        rf = lefts.iloc[rf_i]
+        lr = lefts.iloc[lr_i]
+        for (lf_i, rr_i) in itertools.permutations(range(n_n), 2):
+            lf = rights.iloc[lf_i]
+            rr = rights.iloc[rr_i]
+            m = compute_set_metrics(lf, rf, lr, rr, mode_rr=0.0)
+            candidates.append({
+                'a_idx': (rf_i, lr_i),
+                'n_idx': (lf_i, rr_i),
+                'm':     m,
+            })
+
+    def _solution_score(sol):
+        """Lexicographic score tuple: (stagger, spread, cross_dev, other). Lower is better."""
+        if len(sol) < n_sets:
+            return (float('inf'),) * 4
+        staggers = [c['m']['stagger'] for c in sol]
+        crosses  = [c['m']['cross_weight'] for c in sol]
+        stag_score      = sum(abs(s) for s in staggers)
+        cross_spread    = max(crosses) - min(crosses) if len(crosses) > 1 else 0.0
+        cross_dev_total = sum(abs(c - 50.0) for c in crosses)
+        other_score     = (w_shift * sum(c['m']['shift_count'] - 1 for c in sol)
+                           + w_date * sum(c['m']['date_spread'] for c in sol)
+                           + w_sr   * sum(c['m']['soft_rear_dev'] for c in sol))
+        return (stag_score, cross_spread, cross_dev_total, other_score)
+
+    # --- Multi-start greedy set cover ---
+    N_RC_RESTARTS = 120
+    best_sol   = None
+    best_score = (float('inf'),) * 4
+
+    # Restart 0: sort by per-set stagger deviation first (deterministic best-first)
+    sorted_cands = sorted(candidates, key=lambda c: abs(c['m']['stagger']))
+
+    for restart in range(N_RC_RESTARTS):
+        if restart == 0:
+            pool = sorted_cands
+        else:
+            rng  = np.random.default_rng(restart)
+            pool = [candidates[i] for i in rng.permutation(len(candidates))]
+
+        used_a = set()
+        used_n = set()
+        sol    = []
+        for cand in pool:
+            rf_i, lr_i = cand['a_idx']
+            lf_i, rr_i = cand['n_idx']
+            if (rf_i not in used_a and lr_i not in used_a
+                    and lf_i not in used_n and rr_i not in used_n):
+                sol.append(cand)
+                used_a.update((rf_i, lr_i))
+                used_n.update((lf_i, rr_i))
+                if len(sol) == n_sets:
+                    break
+
+        sc = _solution_score(sol)
+        if sc < best_score:
+            best_score = sc
+            best_sol   = sol
+
+        if progress_callback:
+            progress_callback((restart + 1) / N_RC_RESTARTS)
+
+    if not best_sol:
+        return None, None, float('inf'), [], 0.0
+
+    # --- Local search: swap individual tires between sets until no improvement ---
+    def _make_cand(a_pair, n_pair):
+        rf_i, lr_i = a_pair
+        lf_i, rr_i = n_pair
+        m = compute_set_metrics(
+            rights.iloc[lf_i], lefts.iloc[rf_i],
+            lefts.iloc[lr_i], rights.iloc[rr_i], mode_rr=0.0)
+        return {'a_idx': tuple(a_pair), 'n_idx': tuple(n_pair), 'm': m}
+
+    a_asgn = [list(c['a_idx']) for c in best_sol]  # [n_sets][2]
+    n_asgn = [list(c['n_idx']) for c in best_sol]  # [n_sets][2]
+    positions = [(s, p) for s in range(n_sets) for p in range(2)]
+
+    # Build once; update incrementally — only recompute the 1-2 changed sets per swap
+    curr_sol = [_make_cand(a_asgn[s], n_asgn[s]) for s in range(n_sets)]
+    curr_score = best_score
+
+    ls_improved = True
+    while ls_improved:
+        ls_improved = False
+        # A-pool swaps
+        for (s1, p1), (s2, p2) in itertools.combinations(positions, 2):
+            a_asgn[s1][p1], a_asgn[s2][p2] = a_asgn[s2][p2], a_asgn[s1][p1]
+            new1 = _make_cand(a_asgn[s1], n_asgn[s1])
+            tentative = list(curr_sol)
+            tentative[s1] = new1
+            if s1 != s2:
+                tentative[s2] = _make_cand(a_asgn[s2], n_asgn[s2])
+            sc = _solution_score(tentative)
+            if sc < curr_score:
+                curr_sol = tentative
+                curr_score = sc
+                ls_improved = True
+            else:
+                a_asgn[s1][p1], a_asgn[s2][p2] = a_asgn[s2][p2], a_asgn[s1][p1]
+        # Non-A pool swaps
+        for (s1, p1), (s2, p2) in itertools.combinations(positions, 2):
+            n_asgn[s1][p1], n_asgn[s2][p2] = n_asgn[s2][p2], n_asgn[s1][p1]
+            new1 = _make_cand(a_asgn[s1], n_asgn[s1])
+            tentative = list(curr_sol)
+            tentative[s1] = new1
+            if s1 != s2:
+                tentative[s2] = _make_cand(a_asgn[s2], n_asgn[s2])
+            sc = _solution_score(tentative)
+            if sc < curr_score:
+                curr_sol = tentative
+                curr_score = sc
+                ls_improved = True
+            else:
+                n_asgn[s1][p1], n_asgn[s2][p2] = n_asgn[s2][p2], n_asgn[s1][p1]
+
+    best_sol = curr_sol
+
+    # --- Build perm arrays ---
+    left_perm  = np.zeros(n_a, dtype=np.int64)
+    right_perm = np.zeros(n_n, dtype=np.int64)
+
+    used_a_set = set()
+    used_n_set = set()
+    for s, cand in enumerate(best_sol):
+        rf_i, lr_i = cand['a_idx']
+        lf_i, rr_i = cand['n_idx']
+        left_perm[2 * s]     = rf_i
+        left_perm[2 * s + 1] = lr_i
+        right_perm[2 * s]    = lf_i
+        right_perm[2 * s + 1] = rr_i
+        used_a_set.update((rf_i, lr_i))
+        used_n_set.update((lf_i, rr_i))
+
+    # Fill leftover (unused) tire slots beyond 2*n_sets
+    spare_a = [i for i in range(n_a) if i not in used_a_set]
+    spare_n = [i for i in range(n_n) if i not in used_n_set]
+    for k, idx in enumerate(spare_a):
+        pos = 2 * n_sets + k
+        if pos < n_a:
+            left_perm[pos] = idx
+    for k, idx in enumerate(spare_n):
+        pos = 2 * n_sets + k
+        if pos < n_n:
+            right_perm[pos] = idx
+
+    # --- Compute final metrics ---
+    mode_rr = float(np.mean([rights.iloc[c['n_idx'][1]]["Size"] for c in best_sol]))
+    metrics = [
+        _compute_from_perms(left_perm, right_perm, lefts, rights, s, mode_rr=mode_rr, road_course=True)
+        for s in range(n_sets)
+    ]
+
+    return left_perm, right_perm, best_score, metrics, mode_rr
+
+
+# ============================================================
 # MANUAL SWAP
 # ============================================================
 
@@ -1076,11 +1332,13 @@ def perform_swap(set_a: int, pos_a: str, set_b: int, pos_b: str):
     weights = build_weights(st.session_state.priority_order)
 
     pos_to_idx = {"LF": 0, "LR": 1, "RF": 0, "RR": 1}
+    is_road = st.session_state.track_type == "Road Course"
 
-    if pos_a in ("LF", "LR"):
-        perm = lp
+    if is_road:
+        # Road course: A-pool (RF+LR) → lp, non-A pool (LF+RR) → rp
+        perm = lp if pos_a in ("RF", "LR") else rp
     else:
-        perm = rp
+        perm = lp if pos_a in ("LF", "LR") else rp
 
     idx_a = 2 * set_a + pos_to_idx[pos_a]
     idx_b = 2 * set_b + pos_to_idx[pos_b]
@@ -1090,9 +1348,9 @@ def perform_swap(set_a: int, pos_a: str, set_b: int, pos_b: str):
     # Recompute affected sets
     mode_rr = st.session_state.mode_rr
     metrics = st.session_state.set_metrics
-    metrics[set_a] = _compute_from_perms(lp, rp, lefts, rights, set_a, mode_rr=mode_rr)
+    metrics[set_a] = _compute_from_perms(lp, rp, lefts, rights, set_a, mode_rr=mode_rr, road_course=is_road)
     if set_a != set_b:
-        metrics[set_b] = _compute_from_perms(lp, rp, lefts, rights, set_b, mode_rr=mode_rr)
+        metrics[set_b] = _compute_from_perms(lp, rp, lefts, rights, set_b, mode_rr=mode_rr, road_course=is_road)
 
     st.session_state.set_metrics = metrics
     st.session_state.left_perm = lp
@@ -1141,13 +1399,20 @@ def build_export_csv() -> str:
     rights = st.session_state.rights
     n_sets = st.session_state.n_sets
     metrics = st.session_state.set_metrics
+    is_road = st.session_state.track_type == "Road Course"
 
     rows = []
     for s in range(n_sets):
-        lf = lefts.iloc[lp[2 * s]]
-        lr = lefts.iloc[lp[2 * s + 1]]
-        rf = rights.iloc[rp[2 * s]]
-        rr = rights.iloc[rp[2 * s + 1]]
+        if is_road:
+            rf = lefts.iloc[lp[2 * s]]
+            lr = lefts.iloc[lp[2 * s + 1]]
+            lf = rights.iloc[rp[2 * s]]
+            rr = rights.iloc[rp[2 * s + 1]]
+        else:
+            lf = lefts.iloc[lp[2 * s]]
+            lr = lefts.iloc[lp[2 * s + 1]]
+            rf = rights.iloc[rp[2 * s]]
+            rr = rights.iloc[rp[2 * s + 1]]
         m = metrics[s]
 
         for pos, tire in [("LF", lf), ("RF", rf), ("LR", lr), ("RR", rr)]:
@@ -1195,12 +1460,25 @@ def _tire_html(tire, position: str) -> str:
 
 
 def render_set_card(set_idx: int, metrics: dict, lefts, rights, lp, rp,
-                    target_stagger: float) -> str:
-    """Generate HTML for one set card."""
-    lf = lefts.iloc[lp[2 * set_idx]]
-    lr = lefts.iloc[lp[2 * set_idx + 1]]
-    rf = rights.iloc[rp[2 * set_idx]]
-    rr = rights.iloc[rp[2 * set_idx + 1]]
+                    target_stagger: float, road_course: bool = False) -> str:
+    """Generate HTML for one set card.
+
+    Road Course pool mapping:
+      lefts = A-pool  → physical LR (slot 1) and RF (slot 0, swapped from LF)
+      rights = non-A  → physical RR (slot 1) and LF (slot 0, swapped from RF)
+    """
+    if road_course:
+        # lefts A-pool: slot 0 → RF, slot 1 → LR
+        # rights non-A: slot 0 → LF, slot 1 → RR
+        rf = lefts.iloc[lp[2 * set_idx]]
+        lr = lefts.iloc[lp[2 * set_idx + 1]]
+        lf = rights.iloc[rp[2 * set_idx]]
+        rr = rights.iloc[rp[2 * set_idx + 1]]
+    else:
+        lf = lefts.iloc[lp[2 * set_idx]]
+        lr = lefts.iloc[lp[2 * set_idx + 1]]
+        rf = rights.iloc[rp[2 * set_idx]]
+        rr = rights.iloc[rp[2 * set_idx + 1]]
 
     front_stagger = rf["Size"] - lf["Size"]
     rear_stagger = rr["Size"] - lr["Size"]
@@ -1243,6 +1521,15 @@ def main():
     # CONFIGURE TAB
     # ================================================================
     with tab_config:
+        # ---- Track Type ----
+        track_type = st.radio(
+            "Track Type",
+            options=["Oval", "Road Course"],
+            index=0 if st.session_state.track_type == "Oval" else 1,
+            horizontal=True,
+        )
+        st.session_state.track_type = track_type
+
         # ---- File Upload ----
         uploaded = st.file_uploader(
             "Upload tire scan workbook",
@@ -1259,7 +1546,7 @@ def main():
                     st.session_state.tire_df = tires
                     st.session_state._upload_token = token
 
-                    # Auto-assign D-code sides
+                    # Auto-assign D-code sides (used for Oval mode)
                     dcodes = tires["D-Code"].unique().tolist()
                     if ls_code and ls_code in dcodes:
                         st.session_state.ls_dcode = ls_code
@@ -1270,27 +1557,27 @@ def main():
                         ls_codes = [d for d in dcodes if d != rs_code]
                         st.session_state.ls_dcode = ls_codes[0] if ls_codes else None
                     else:
-                        # Auto-detect by average size (smaller = left)
                         means = tires.groupby("D-Code")["Size"].mean()
                         sorted_codes = means.sort_values().index.tolist()
                         st.session_state.ls_dcode = sorted_codes[0]
                         st.session_state.rs_dcode = sorted_codes[-1] if len(sorted_codes) > 1 else None
 
-                    # Split pools
-                    ls_dc = st.session_state.ls_dcode
-                    st.session_state.lefts = tires[tires["D-Code"] == ls_dc].reset_index(drop=True)
-                    st.session_state.rights = tires[tires["D-Code"] != ls_dc].reset_index(drop=True)
+                    # Split pools based on track type
+                    lefts, rights = split_pools(tires, track_type, st.session_state.ls_dcode)
+                    st.session_state.lefts = lefts
+                    st.session_state.rights = rights
 
                     # Stagger analysis
-                    info = analyze_stagger(st.session_state.lefts, st.session_state.rights)
+                    info = analyze_stagger(lefts, rights)
                     st.session_state.stagger_info = info
                     st.session_state.n_sets = info["n_sets"]
-                    st.session_state.target_stagger = info["max_achievable"]
+                    st.session_state.target_stagger = 0.0 if track_type == "Road Course" else info["max_achievable"]
+                    st.session_state._last_track_type = track_type
                     st.session_state.data_loaded = True
 
-                    # Pre-compute mode RR rollout for common RR rollout priority
-                    r_sizes = st.session_state.rights["Size"].values
-                    st.session_state.mode_rr = float(Counter(r_sizes).most_common(1)[0][0])
+                    # Pre-compute mode RR rollout (rights pool = physical RR for both modes)
+                    r_sizes = rights["Size"].values
+                    st.session_state.mode_rr = float(Counter(r_sizes).most_common(1)[0][0]) if len(r_sizes) > 0 else 0.0
 
                     # Clear previous solution
                     st.session_state.left_perm = None
@@ -1310,12 +1597,39 @@ def main():
         rights = st.session_state.rights
         info = st.session_state.stagger_info
 
+        # Re-split pools if track type changed since last upload/split
+        if track_type != st.session_state._last_track_type:
+            new_lefts, new_rights = split_pools(tires, track_type, st.session_state.ls_dcode)
+            st.session_state.lefts = new_lefts
+            st.session_state.rights = new_rights
+            new_info = analyze_stagger(new_lefts, new_rights)
+            st.session_state.stagger_info = new_info
+            st.session_state.n_sets = new_info["n_sets"]
+            st.session_state.target_stagger = 0.0 if track_type == "Road Course" else new_info["max_achievable"]
+            r_sizes = new_rights["Size"].values
+            st.session_state.mode_rr = float(Counter(r_sizes).most_common(1)[0][0]) if len(r_sizes) > 0 else 0.0
+            st.session_state._last_track_type = track_type
+            # Clear any previous solution since pools changed
+            st.session_state.left_perm = None
+            st.session_state.right_perm = None
+            st.session_state.set_metrics = None
+            st.session_state.variant_solutions = {}
+            st.rerun()
+
+        lefts = st.session_state.lefts
+        rights = st.session_state.rights
+        info = st.session_state.stagger_info
+
         # Data summary
         st.subheader("Tire Inventory")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Tires", len(tires))
-        c2.metric("Left Side", f"{len(lefts)}  (D-Code {st.session_state.ls_dcode})")
-        c3.metric("Right Side", f"{len(rights)}  (D-Code {st.session_state.rs_dcode})")
+        if track_type == "Road Course":
+            c2.metric("A Pool (LR/RF)", len(lefts))
+            c3.metric("Non-A Pool (LF/RR)", len(rights))
+        else:
+            c2.metric("Left Side", f"{len(lefts)}  (D-Code {st.session_state.ls_dcode})")
+            c3.metric("Right Side", f"{len(rights)}  (D-Code {st.session_state.rs_dcode})")
         c4.metric("Sets", info["n_sets"])
 
         if info["unused_lefts"] > 0 or info["unused_rights"] > 0:
@@ -1323,46 +1637,51 @@ def main():
                 f"Unused tires: {info['unused_lefts']} left, {info['unused_rights']} right"
             )
 
-        # D-Code override
-        with st.expander("D-Code Side Assignment", expanded=False):
-            dcodes = tires["D-Code"].unique().tolist()
-            new_ls = st.selectbox(
-                "Left-side D-Code",
-                dcodes,
-                index=dcodes.index(st.session_state.ls_dcode)
-                if st.session_state.ls_dcode in dcodes else 0,
-            )
-            if new_ls != st.session_state.ls_dcode:
-                st.session_state.ls_dcode = new_ls
-                rs_codes = [d for d in dcodes if d != new_ls]
-                st.session_state.rs_dcode = rs_codes[0] if rs_codes else None
-                st.session_state.lefts = tires[tires["D-Code"] == new_ls].reset_index(drop=True)
-                st.session_state.rights = tires[tires["D-Code"] != new_ls].reset_index(drop=True)
-                new_info = analyze_stagger(st.session_state.lefts, st.session_state.rights)
-                st.session_state.stagger_info = new_info
-                st.session_state.n_sets = new_info["n_sets"]
-                st.session_state.target_stagger = new_info["max_achievable"]
-                r_sizes = st.session_state.rights["Size"].values
-                st.session_state.mode_rr = float(Counter(r_sizes).most_common(1)[0][0])
-                st.rerun()
+        # D-Code override (Oval only)
+        if track_type == "Oval":
+            with st.expander("D-Code Side Assignment", expanded=False):
+                dcodes = tires["D-Code"].unique().tolist()
+                new_ls = st.selectbox(
+                    "Left-side D-Code",
+                    dcodes,
+                    index=dcodes.index(st.session_state.ls_dcode)
+                    if st.session_state.ls_dcode in dcodes else 0,
+                )
+                if new_ls != st.session_state.ls_dcode:
+                    st.session_state.ls_dcode = new_ls
+                    rs_codes = [d for d in dcodes if d != new_ls]
+                    st.session_state.rs_dcode = rs_codes[0] if rs_codes else None
+                    st.session_state.lefts = tires[tires["D-Code"] == new_ls].reset_index(drop=True)
+                    st.session_state.rights = tires[tires["D-Code"] != new_ls].reset_index(drop=True)
+                    new_info = analyze_stagger(st.session_state.lefts, st.session_state.rights)
+                    st.session_state.stagger_info = new_info
+                    st.session_state.n_sets = new_info["n_sets"]
+                    st.session_state.target_stagger = new_info["max_achievable"]
+                    r_sizes = st.session_state.rights["Size"].values
+                    st.session_state.mode_rr = float(Counter(r_sizes).most_common(1)[0][0]) if len(r_sizes) > 0 else 0.0
+                    st.rerun()
 
         st.divider()
 
         # Stagger configuration
         st.subheader("Stagger Target")
-        sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("Min Achievable", f"{info['min_achievable']:.1f} mm")
-        sc2.metric("Max Achievable", f"{info['max_achievable']:.1f} mm")
+        if track_type == "Road Course":
+            st.session_state.target_stagger = 0.0
+            st.info("Road Course — rear stagger locked to **0** (zero stagger target)")
+        else:
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Min Achievable", f"{info['min_achievable']:.1f} mm")
+            sc2.metric("Max Achievable", f"{info['max_achievable']:.1f} mm")
 
-        target = sc3.number_input(
-            "Target Stagger (mm)",
-            min_value=0.0,
-            max_value=float(info["max_achievable"] + 20),
-            value=float(st.session_state.target_stagger),
-            step=0.5,
-            help="Stagger = RR size - LR size. Defaults to max achievable across all sets."
-        )
-        st.session_state.target_stagger = target
+            target = sc3.number_input(
+                "Target Stagger (mm)",
+                min_value=0.0,
+                max_value=float(info["max_achievable"] + 20),
+                value=float(st.session_state.target_stagger),
+                step=0.5,
+                help="Stagger = RR size - LR size. Defaults to max achievable across all sets."
+            )
+            st.session_state.target_stagger = target
 
         st.divider()
 
@@ -1374,13 +1693,23 @@ def main():
         )
         st.caption("Drag to reorder secondary priorities:")
 
+        # Common RR Rollout is oval-only — hide for road course
+        visible_priorities = [
+            p for p in st.session_state.priority_order
+            if not (track_type == "Road Course" and p == "Common RR Rollout")
+        ]
+
         if HAS_SORTABLES:
-            new_order = sort_items(st.session_state.priority_order)
-            if new_order != st.session_state.priority_order:
-                st.session_state.priority_order = new_order
+            new_order = sort_items(visible_priorities)
+            # Merge back: keep full list order but update visible positions
+            if new_order != visible_priorities:
+                rr_slot = st.session_state.priority_order.index("Common RR Rollout")
+                full = list(new_order)
+                full.insert(rr_slot, "Common RR Rollout")
+                st.session_state.priority_order = full
         else:
             # Fallback: up/down buttons
-            prio = st.session_state.priority_order
+            prio = visible_priorities
             for i, p in enumerate(prio):
                 pc1, pc2, pc3 = st.columns([4, 1, 1])
                 pc1.write(f"**#{i + 2}** — {p}")
@@ -1402,26 +1731,43 @@ def main():
             _n_sets = st.session_state.n_sets
             _target = st.session_state.target_stagger
             _prio = st.session_state.priority_order
+            is_rc = (track_type == "Road Course")
 
-            # Pre-extract arrays once, share across all runs
-            _arrays = _extract_arrays(_lefts, _rights)
+            # Pre-extract arrays for oval SA; not needed for road course
+            _arrays = None if is_rc else _extract_arrays(_lefts, _rights)
 
-            engine = "Numba JIT" if HAS_NUMBA else "Python"
-            progress = st.progress(0, text=f"Optimizing ({engine})...")
-            total_steps = N_RESTARTS + QUICK_RESTARTS * len(PRIORITY_OPTIONS)
+            # Common RR Rollout not meaningful for road course
+            active_options = [
+                p for p in PRIORITY_OPTIONS
+                if not (is_rc and p == "Common RR Rollout")
+            ]
+
+            rc_label = "Road Course" if is_rc else ("Numba JIT" if HAS_NUMBA else "Python")
+            progress = st.progress(0, text=f"Optimizing ({rc_label})...")
+            _RC_STEPS = 120
+            main_steps = _RC_STEPS if is_rc else N_RESTARTS
+            var_steps  = _RC_STEPS if is_rc else QUICK_RESTARTS
+            total_steps = main_steps + var_steps * len(active_options)
             done_steps = [0]
             t0 = time.perf_counter()
 
             def _update_main(frac):
-                done_steps[0] = int(frac * N_RESTARTS)
-                progress.progress(done_steps[0] / total_steps,
-                                  text=f"Original Sort — restart {done_steps[0]}/{N_RESTARTS}")
+                done_steps[0] = int(frac * main_steps)
+                lbl = ("Original Sort (RC)" if is_rc
+                       else f"Original Sort — restart {done_steps[0]}/{N_RESTARTS}")
+                progress.progress(done_steps[0] / total_steps, text=lbl)
 
             # 1) Full optimization with user's priority order
-            lp, rp, score, metrics, rr_mode = run_optimizer(
-                _lefts, _rights, _n_sets, _target, _prio,
-                progress_callback=_update_main, _precomputed_arrays=_arrays,
-            )
+            if is_rc:
+                lp, rp, score, metrics, rr_mode = solve_road_course(
+                    _lefts, _rights, _n_sets, _prio,
+                    progress_callback=_update_main,
+                )
+            else:
+                lp, rp, score, metrics, rr_mode = run_optimizer(
+                    _lefts, _rights, _n_sets, _target, _prio,
+                    progress_callback=_update_main, _precomputed_arrays=_arrays,
+                )
             st.session_state.mode_rr = float(rr_mode)
             variants = {}
             # Reorder original sort by RR rollout grouping
@@ -1432,22 +1778,28 @@ def main():
             }
 
             # 2) Quick variants — each priority promoted to #1 secondary
-            base_done = N_RESTARTS
-            for vi, pname in enumerate(PRIORITY_OPTIONS):
+            base_done = main_steps
+            for vi, pname in enumerate(active_options):
                 var_label = f"Optimal {_BTN_LABELS.get(pname, pname)}"
-                var_prio = [pname] + [p for p in PRIORITY_OPTIONS if p != pname]
+                var_prio = [pname] + [p for p in active_options if p != pname]
 
                 def _update_var(frac, _vi=vi, _label=var_label):
-                    step = base_done + _vi * QUICK_RESTARTS + int(frac * QUICK_RESTARTS)
+                    step = base_done + _vi * var_steps + int(frac * var_steps)
                     progress.progress(step / total_steps,
-                                      text=f"{_label} — restart {int(frac * QUICK_RESTARTS)}/{QUICK_RESTARTS}")
+                                      text=f"{_label} — {int(frac * var_steps)}/{var_steps}")
 
-                vlp, vrp, vscore, vmetrics, _ = run_optimizer(
-                    _lefts, _rights, _n_sets, _target, var_prio,
-                    progress_callback=_update_var,
-                    n_restarts=QUICK_RESTARTS, n_iterations=QUICK_ITERATIONS,
-                    _precomputed_arrays=_arrays,
-                )
+                if is_rc:
+                    vlp, vrp, vscore, vmetrics, _ = solve_road_course(
+                        _lefts, _rights, _n_sets, var_prio,
+                        progress_callback=_update_var,
+                    )
+                else:
+                    vlp, vrp, vscore, vmetrics, _ = run_optimizer(
+                        _lefts, _rights, _n_sets, _target, var_prio,
+                        progress_callback=_update_var,
+                        n_restarts=QUICK_RESTARTS, n_iterations=QUICK_ITERATIONS,
+                        _precomputed_arrays=_arrays,
+                    )
                 # Reorder all variants: group by RR rollout, least common first
                 vlp, vrp, vmetrics = _reorder_sets_by_rr(
                     vlp, vrp, vmetrics, _n_sets)
@@ -1466,7 +1818,7 @@ def main():
             st.session_state.solution_score = score
             st.session_state.set_metrics = metrics
             progress.empty()
-            st.success(f"Optimization complete in {elapsed:.1f}s ({engine})")
+            st.success(f"Optimization complete in {elapsed:.1f}s ({rc_label})")
             st.rerun()
 
         # Quick preview of data
@@ -1539,6 +1891,7 @@ def main():
         n_sets = st.session_state.n_sets
         metrics = st.session_state.set_metrics
         target = st.session_state.target_stagger
+        is_road = st.session_state.track_type == "Road Course"
 
         # ---- Set cards in grid — auto-fit to up to 3 rows, consistent widths ----
         if n_sets <= 2:
@@ -1554,16 +1907,22 @@ def main():
             cols = st.columns(cards_per_row)
             for col, si in zip(cols, range(row_start, row_end)):
                 with col:
-                    html = render_set_card(si, metrics[si], lefts, rights, lp, rp, target)
+                    html = render_set_card(si, metrics[si], lefts, rights, lp, rp, target, road_course=is_road)
                     st.markdown(html, unsafe_allow_html=True)
 
         # ---- Manual Swap Panel ----
 
-        # Build lookup: tire ID → (side, set_idx, position)
+        # Build lookup: tire ID → (set_idx, position)
+        # Road course: lefts=A-pool→RF(slot0)/LR(slot1), rights=non-A→LF(slot0)/RR(slot1)
         tire_lookup = {}
+        if is_road:
+            pos_map = [("RF", lefts, lp), ("LR", lefts, lp),
+                       ("LF", rights, rp), ("RR", rights, rp)]
+        else:
+            pos_map = [("LF", lefts, lp), ("LR", lefts, lp),
+                       ("RF", rights, rp), ("RR", rights, rp)]
         for s in range(n_sets):
-            for pos, pool, perm in [("LF", lefts, lp), ("LR", lefts, lp),
-                                     ("RF", rights, rp), ("RR", rights, rp)]:
+            for pos, pool, perm in pos_map:
                 slot = 2 * s + (0 if pos in ("LF", "RF") else 1)
                 tire = pool.iloc[perm[slot]]
                 tire_lookup[str(tire["Tire_ID"])] = (s, pos)
@@ -1599,13 +1958,22 @@ def main():
             else:
                 set_a, pos_a = tire_lookup[id_a]
                 set_b, pos_b = tire_lookup[id_b]
-                side_a = "L" if pos_a[0] == "L" else "R"
-                side_b = "L" if pos_b[0] == "L" else "R"
-                if side_a != side_b:
-                    st.error("Cannot swap left-side and right-side tires.")
+                if is_road:
+                    pool_a = "A" if pos_a in ("RF", "LR") else "N"
+                    pool_b = "A" if pos_b in ("RF", "LR") else "N"
+                    if pool_a != pool_b:
+                        st.error("Cannot swap A-pool (RF/LR) and non-A pool (LF/RR) tires.")
+                    else:
+                        perform_swap(set_a, pos_a, set_b, pos_b)
+                        st.rerun()
                 else:
-                    perform_swap(set_a, pos_a, set_b, pos_b)
-                    st.rerun()
+                    side_a = "L" if pos_a[0] == "L" else "R"
+                    side_b = "L" if pos_b[0] == "L" else "R"
+                    if side_a != side_b:
+                        st.error("Cannot swap left-side and right-side tires.")
+                    else:
+                        perform_swap(set_a, pos_a, set_b, pos_b)
+                        st.rerun()
 
         # ---- Set Swap + Copy IDs ----
         ss1, ss2, ss3, ss4 = st.columns([2, 2, 1.5, 1.5])
@@ -1620,10 +1988,16 @@ def main():
             # Build 2x2 clipboard text (tab-separated for Excel paste)
             clip_lines = []
             for s in range(n_sets):
-                lf_id = lefts.iloc[lp[2 * s]]["Tire_ID"]
-                lr_id = lefts.iloc[lp[2 * s + 1]]["Tire_ID"]
-                rf_id = rights.iloc[rp[2 * s]]["Tire_ID"]
-                rr_id = rights.iloc[rp[2 * s + 1]]["Tire_ID"]
+                if is_road:
+                    rf_id = lefts.iloc[lp[2 * s]]["Tire_ID"]
+                    lr_id = lefts.iloc[lp[2 * s + 1]]["Tire_ID"]
+                    lf_id = rights.iloc[rp[2 * s]]["Tire_ID"]
+                    rr_id = rights.iloc[rp[2 * s + 1]]["Tire_ID"]
+                else:
+                    lf_id = lefts.iloc[lp[2 * s]]["Tire_ID"]
+                    lr_id = lefts.iloc[lp[2 * s + 1]]["Tire_ID"]
+                    rf_id = rights.iloc[rp[2 * s]]["Tire_ID"]
+                    rr_id = rights.iloc[rp[2 * s + 1]]["Tire_ID"]
                 clip_lines.append(f"{lf_id}\\t{rf_id}")
                 clip_lines.append(f"{lr_id}\\t{rr_id}")
                 if s < n_sets - 1:
